@@ -1,3 +1,4 @@
 node_modules/
-/app.json
 .homeybuild/
+app.json
+package-lock.json

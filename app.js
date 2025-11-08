@@ -10,7 +10,7 @@ class TouchWandApp extends Homey.App {
   }
 
   _registerActionCards() {
-    this._registerAction('turn_endpoint_on', async (args) => {
+    this._registerAction('turn_endpoint_on', async args => {
       const cap = `onoff.ep${args.endpoint.id}`;
       if (!args.device.hasCapability(cap)) {
         throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
@@ -18,7 +18,7 @@ class TouchWandApp extends Homey.App {
       await args.device.queueCapabilityCommand(cap, true);
     });
 
-    this._registerAction('turn_endpoint_off', async (args) => {
+    this._registerAction('turn_endpoint_off', async args => {
       const cap = `onoff.ep${args.endpoint.id}`;
       if (!args.device.hasCapability(cap)) {
         throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
@@ -26,7 +26,7 @@ class TouchWandApp extends Homey.App {
       await args.device.queueCapabilityCommand(cap, false);
     });
 
-    this._registerAction('toggle_endpoint', async (args) => {
+    this._registerAction('toggle_endpoint', async args => {
       const cap = `onoff.ep${args.endpoint.id}`;
       if (!args.device.hasCapability(cap)) {
         throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
@@ -35,20 +35,24 @@ class TouchWandApp extends Homey.App {
       await args.device.queueCapabilityCommand(cap, !currentState);
     });
 
-    this._registerAction('set_endpoint_dim', async (args) => {
-      const dimCap = `dim.ep${args.endpoint.id}`;
-      const onoffCap = `onoff.ep${args.endpoint.id}`;
+    this._registerAction(
+      'set_endpoint_dim',
+      async args => {
+        const dimCap = `dim.ep${args.endpoint.id}`;
+        const onoffCap = `onoff.ep${args.endpoint.id}`;
 
-      if (!args.device.hasCapability(dimCap)) {
-        throw new Error(`Endpoint ${args.endpoint.id} does not have a dim capability`);
-      }
+        if (!args.device.hasCapability(dimCap)) {
+          throw new Error(`Endpoint ${args.endpoint.id} does not have a dim capability`);
+        }
 
-      await args.device.queueCapabilityCommand(dimCap, args.level);
+        await args.device.queueCapabilityCommand(dimCap, args.level);
 
-      if (args.device.hasCapability(onoffCap)) {
-        await args.device.queueCapabilityCommand(onoffCap, args.level > 0);
-      }
-    }, true);
+        if (args.device.hasCapability(onoffCap)) {
+          await args.device.queueCapabilityCommand(onoffCap, args.level > 0);
+        }
+      },
+      true
+    );
   }
 
   _registerAction(id, runListener, onlyDimmers = false) {
@@ -64,7 +68,7 @@ class TouchWandApp extends Homey.App {
   _registerConditionCards() {
     const isOnCondition = this.homey.flow.getConditionCard('endpoint_is_on');
     if (isOnCondition) {
-      isOnCondition.registerRunListener(async (args) =>
+      isOnCondition.registerRunListener(async args =>
         args.device._handleEndpointIsOn({ endpoint: args.endpoint })
       );
       isOnCondition.registerArgumentAutocompleteListener('endpoint', async (query, args) =>
@@ -74,11 +78,11 @@ class TouchWandApp extends Homey.App {
 
     const dimCompareCondition = this.homey.flow.getConditionCard('endpoint_dim_compare');
     if (dimCompareCondition) {
-      dimCompareCondition.registerRunListener(async (args) =>
+      dimCompareCondition.registerRunListener(async args =>
         args.device._handleEndpointDimCompare({
           endpoint: args.endpoint,
           comparison: args.comparison,
-          level: args.level
+          level: args.level,
         })
       );
       dimCompareCondition.registerArgumentAutocompleteListener('endpoint', async (query, args) =>

@@ -153,9 +153,7 @@
       }
     }
   ],
-  "platforms": [
-    "local"
-  ],
+  "platforms": ["local"],
   "zwave": {
     "learnmode": {
       "image": "/drivers/wallwand/assets/icon.svg",
@@ -163,25 +161,13 @@
         "en": "Put the WallWand into inclusion mode (triple-tap or per manual) and keep it within ~2m of Homey."
       }
     },
-    "manufacturerId": [
-      0
-    ],
-    "productTypeId": [
-      3
-    ],
-    "productId": [
-      12
-    ],
-    "deviceClassGeneric": [
-      16
-    ],
-    "commandClasses": [
-      38
-    ]
+    "manufacturerId": [0],
+    "productTypeId": [3],
+    "productId": [12],
+    "deviceClassGeneric": [16],
+    "commandClasses": [38]
   },
-  "connectivity": [
-    "zwave"
-  ],
+  "connectivity": ["zwave"],
   "flow": {
     "triggers": [
       {
