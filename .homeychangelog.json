@@ -10,5 +10,8 @@
   },
   "0.1.3": {
     "en": "Add code quality tooling and development workflow improvements"
+  },
+  "0.1.4": {
+    "en": "Stability improvements"
   }
 }
