@@ -31,7 +31,7 @@ class TouchWandApp extends Homey.App {
       if (!args.device.hasCapability(cap)) {
         throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
       }
-      const currentState = args.device.getCapabilityValue(cap);
+      const currentState = args.device.getCapabilityValue(cap) ?? false;
       await args.device.queueCapabilityCommand(cap, !currentState);
     });
 
