@@ -13,7 +13,7 @@ class CommandQueue {
     this.COMMAND_DELAY_MS = ms;
   }
 
-  setTimeout(ms) {
+  setCommandTimeout(ms) {
     this.COMMAND_TIMEOUT_MS = ms;
   }
 
@@ -37,7 +37,6 @@ class CommandQueue {
         description,
         resolve,
         reject,
-        timestamp: Date.now(),
       });
 
       if (!this._isProcessing) {

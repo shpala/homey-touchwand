@@ -17,7 +17,7 @@ describe('CommandQueue', () => {
     };
     queue = new CommandQueue(mockLogger);
     queue.setDelay(10); // Short delay for tests
-    queue.setTimeout(100); // Short timeout for tests
+    queue.setCommandTimeout(100); // Short timeout for tests
   });
 
   test('should execute a single command', async () => {

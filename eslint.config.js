@@ -46,6 +46,11 @@ module.exports = [
       'node/no-extraneous-require': 'off',
       'node/no-unpublished-require': 'off',
       'no-restricted-syntax': 'off',
+      // These athom rules fight with Prettier, which runs last in lint-staged and wins
+      'arrow-parens': 'off',
+      'operator-linebreak': 'off',
+      'implicit-arrow-linebreak': 'off',
+      'function-paren-newline': 'off',
     },
   },
   {
@@ -57,6 +62,7 @@ module.exports = [
     },
     rules: {
       'no-unused-expressions': 'off',
+      'no-empty-function': 'off',
     },
   },
   {

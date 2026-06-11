@@ -47,8 +47,9 @@ class TouchWandApp extends Homey.App {
 
         await args.device.queueCapabilityCommand(dimCap, args.level);
 
+        // The dim command already switches the load, just mirror onoff locally
         if (args.device.hasCapability(onoffCap)) {
-          await args.device.queueCapabilityCommand(onoffCap, args.level > 0);
+          await args.device._setOnOff(onoffCap, args.level > 0, args.endpoint.id);
         }
       },
       true

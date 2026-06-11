@@ -2,3 +2,12 @@ node_modules/
 .homeybuild/
 app.json
 package-lock.json
+
+# local tool caches
+.codesage/
+.cocoindex_code/
+.playwright-mcp/
+.serena/
+.sqry/
+.claude/
+blog-post-revised.md

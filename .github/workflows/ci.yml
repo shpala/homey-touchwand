@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm test
+      - name: Check version sync
+        run: |
+          APP_VERSION=$(node -p "require('./.homeycompose/app.json').version")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$APP_VERSION" != "$PKG_VERSION" ]; then
+            echo "Version mismatch: .homeycompose/app.json=$APP_VERSION vs package.json=$PKG_VERSION"
+            exit 1
+          fi
