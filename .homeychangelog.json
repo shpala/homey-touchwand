@@ -16,5 +16,8 @@
   },
   "0.1.5": {
     "en": "Fixed the 'Endpoint state changed' flow trigger, fixed endpoint autocomplete when multiple panels are paired, faster and quieter startup"
+  },
+  "0.1.6": {
+    "en": "Verify endpoint types against the live panel (fixes endpoints mis-typed by the factory-layout interview); stop showing fabricated blind state."
   }
 }

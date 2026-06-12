@@ -10,7 +10,7 @@
   "category": [
     "tools"
   ],
-  "version": "0.1.5",
+  "version": "0.1.6",
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "platforms": [
@@ -488,7 +488,7 @@
         },
         "dim.ep1": {
           "title": {
-            "en": "Dimmer 1"
+            "en": "Blind 1"
           }
         },
         "onoff.ep2": {
@@ -498,7 +498,7 @@
         },
         "dim.ep2": {
           "title": {
-            "en": "Dimmer 2"
+            "en": "Blind 2"
           }
         },
         "onoff.ep3": {
@@ -508,7 +508,7 @@
         },
         "dim.ep3": {
           "title": {
-            "en": "Dimmer 3"
+            "en": "Blind 3"
           }
         },
         "onoff.ep4": {
@@ -518,7 +518,7 @@
         },
         "dim.ep4": {
           "title": {
-            "en": "Dimmer 4"
+            "en": "Blind 4"
           }
         },
         "onoff.ep5": {
@@ -528,7 +528,7 @@
         },
         "dim.ep5": {
           "title": {
-            "en": "Dimmer 5"
+            "en": "Blind 5"
           }
         },
         "onoff.ep6": {
@@ -538,7 +538,7 @@
         },
         "dim.ep6": {
           "title": {
-            "en": "Dimmer 6"
+            "en": "Blind 6"
           }
         }
       },

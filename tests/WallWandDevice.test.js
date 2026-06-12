@@ -136,6 +136,31 @@ function makeNode(endpoints = {}) {
   };
 }
 
+// Shape verified on real hardware: numeric device classes plus a raw CC id buffer
+function makeLiveCapabilityReport(endpointNum, genericClass, commandClassIds) {
+  return {
+    Properties1: { 'End Point': endpointNum, Dynamic: false },
+    'Generic Device Class': genericClass,
+    'Specific Device Class': 1,
+    'Command Class (Raw)': Buffer.from(commandClassIds),
+  };
+}
+
+function addMultiChannelCommandClass(node, reportsByEndpoint = {}) {
+  node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL = makeCommandClassMock({
+    MULTI_CHANNEL_CAPABILITY_GET: jest.fn(async args => {
+      const endpointNum = Buffer.isBuffer(args?.Properties1)
+        ? args.Properties1[0]
+        : args?.Properties1?.['End Point'];
+      const report = reportsByEndpoint[endpointNum];
+      if (report instanceof Error) throw report;
+      if (!report) throw new Error('timeout after 10000ms');
+      return report;
+    }),
+  });
+  return node;
+}
+
 describe('WallWandDevice', () => {
   let device;
 
@@ -212,6 +237,20 @@ describe('WallWandDevice', () => {
 
       expect(discoverSpy).not.toHaveBeenCalled();
     });
+
+    test('rediscovery persists endpoints verified along the way', async () => {
+      // Type known but capabilities missing, so the rediscovery path runs and
+      // the probe verifies EP1 through the already-known branch
+      device._endpointTypes = { 1: DEVICE_TYPES.SWITCH };
+      const node = makeNode({ 1: makeBinaryEndpoint(255) });
+      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 16, [0x25]) });
+      device.node = node;
+
+      await device._checkDeviceHealth();
+
+      expect(device._endpointTypesVerified[1]).toBe(true);
+      expect(device._store.endpointTypesVerified[1]).toBe(true);
+    });
   });
 
   describe('sync failure handling', () => {
@@ -264,6 +303,21 @@ describe('WallWandDevice', () => {
 
       expect(device.hasCapability('onoff.ep1')).toBe(true);
       expect(device._endpointTypes[1]).toBe(DEVICE_TYPES.SWITCH);
+    });
+
+    test('dropping an endpoint clears its verified flag so rediscovery probes again', async () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.SWITCH };
+      device._endpointTypesVerified = { 1: true };
+      await device.addCapability('onoff.ep1');
+      const endpoint = makeFailingEndpoint();
+
+      for (let i = 0; i < WallWandDevice.MAX_SYNC_FAILURES; i++) {
+        await device._syncOneEndpointState(1, endpoint);
+      }
+
+      expect(device._endpointTypes[1]).toBeNull();
+      expect(device._endpointTypesVerified[1]).toBeUndefined();
+      expect(device._store.endpointTypesVerified?.[1]).toBeUndefined();
     });
 
     test('transient errors never remove capabilities', async () => {
@@ -577,6 +631,569 @@ describe('WallWandDevice', () => {
       expect(device._isValidReport({}, 'Current Value')).toBe(false);
       expect(device._isValidReport({ 'Current Value': null }, 'Current Value')).toBe(false);
       expect(device._isValidReport(null, 'Current Value')).toBe(false);
+    });
+  });
+
+  describe('live endpoint verification', () => {
+    test('maps a live binary switch report to the switch type', async () => {
+      const node = makeNode({});
+      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 16, [0x25, 0x85]) });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(1)).resolves.toBe(DEVICE_TYPES.SWITCH);
+    });
+
+    test('maps a live multilevel report to the dimmer type', async () => {
+      const node = makeNode({});
+      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 17, [0x26, 0x85]) });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(1)).resolves.toBe(DEVICE_TYPES.DIMMER);
+    });
+
+    test('returns null for a wall controller endpoint', async () => {
+      const node = makeNode({});
+      addMultiChannelCommandClass(node, { 5: makeLiveCapabilityReport(5, 24, [0x5b]) });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(5)).resolves.toBeNull();
+    });
+
+    test('returns null when the live class and live CC list disagree', async () => {
+      const node = makeNode({});
+      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 16, [0x26]) });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(1)).resolves.toBeNull();
+    });
+
+    test('returns undefined when the probe times out', async () => {
+      const node = makeNode({});
+      addMultiChannelCommandClass(node, {});
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(1)).resolves.toBeUndefined();
+    });
+
+    test('returns undefined when the root node lacks the multi channel command class', async () => {
+      device.node = makeNode({});
+
+      await expect(device._verifyEndpointLive(1)).resolves.toBeUndefined();
+    });
+
+    test('onNodeInit resets live classes remembered from a previous session', async () => {
+      device._liveGenericClasses = { 3: 17 };
+      const node = makeNode({ 1: makeBinaryEndpoint(255) });
+      device.node = node;
+
+      await device.onNodeInit({ node });
+
+      expect(device._liveGenericClasses).toEqual({});
+    });
+
+    test('retries with the raw byte form when the encoder rejects the object form', async () => {
+      const node = makeNode({});
+      node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL = makeCommandClassMock({
+        MULTI_CHANNEL_CAPABILITY_GET: jest
+          .fn()
+          .mockRejectedValueOnce(new Error('invalid payload'))
+          .mockResolvedValue(makeLiveCapabilityReport(1, 16, [0x25])),
+      });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(1)).resolves.toBe(DEVICE_TYPES.SWITCH);
+
+      const { calls } =
+        node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL.MULTI_CHANNEL_CAPABILITY_GET.mock;
+      expect(Buffer.isBuffer(calls[1][0].Properties1)).toBe(true);
+    });
+  });
+
+  describe('live re-typing of mistyped endpoints', () => {
+    // Entrance EP2: the cached interview says multilevel (factory layout), the
+    // live panel is a binary switch; its cached CC list lacks SWITCH_BINARY and
+    // the multilevel GET times out forever
+    function makeStaleMultilevelEndpoint() {
+      return {
+        deviceClassGeneric: 'GENERIC_TYPE_SWITCH_MULTILEVEL',
+        CommandClass: {
+          COMMAND_CLASS_BASIC: makeCommandClassMock(),
+          COMMAND_CLASS_SWITCH_MULTILEVEL: makeCommandClassMock({
+            SWITCH_MULTILEVEL_GET: jest.fn().mockRejectedValue(new Error('timeout after 10000ms')),
+          }),
+        },
+      };
+    }
+
+    test('re-types a stored dimmer to switch when the live panel reports a binary switch', async () => {
+      const node = makeNode({ 2: makeStaleMultilevelEndpoint() });
+      addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25, 0x85]) });
+      device.node = node;
+      device._store.endpointTypes = { 2: DEVICE_TYPES.DIMMER };
+      await device.addCapability('onoff.ep2');
+      await device.addCapability('dim.ep2');
+      const regSpy = jest.spyOn(device, 'registerCapability');
+
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[2]).toBe(DEVICE_TYPES.SWITCH);
+      expect(device.hasCapability('dim.ep2')).toBe(false);
+      expect(device.hasCapability('onoff.ep2')).toBe(true);
+      expect(device._store.endpointTypesVerified[2]).toBe(true);
+      // The stale cache has no SWITCH_BINARY on this endpoint, so onoff must
+      // be wired through BASIC (present on every endpoint)
+      expect(regSpy).toHaveBeenCalledWith(
+        'onoff.ep2',
+        'BASIC',
+        expect.objectContaining({ multiChannelNodeId: 2, getOpts: { getOnStart: false } })
+      );
+    });
+
+    test('a later full rediscovery keeps the verified type instead of the stale cache', async () => {
+      const node = makeNode({ 2: makeStaleMultilevelEndpoint() });
+      addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25, 0x85]) });
+      device.node = node;
+      device._store.endpointTypes = { 2: DEVICE_TYPES.DIMMER };
+
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[2]).toBe(DEVICE_TYPES.SWITCH);
+
+      const probe = node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL.MULTI_CHANNEL_CAPABILITY_GET;
+      probe.mockClear();
+
+      // A health-check rediscovery walks the stale interview cache again; the
+      // verified type must win without another live probe
+      await device._discoverAllEndpoints(node);
+
+      expect(device._endpointTypes[2]).toBe(DEVICE_TYPES.SWITCH);
+      expect(device.hasCapability('dim.ep2')).toBe(false);
+      expect(device.hasCapability('onoff.ep2')).toBe(true);
+      expect(probe).not.toHaveBeenCalled();
+    });
+
+    test('a non-transient registration failure forgets the verification so a later init re-probes', async () => {
+      const node = makeNode({ 2: makeStaleMultilevelEndpoint() });
+      addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25, 0x85]) });
+      device.node = node;
+      device._store.endpointTypes = { 2: DEVICE_TYPES.DIMMER };
+      const regSpy = jest.spyOn(device, 'registerCapability').mockImplementation(() => {
+        throw new Error('unknown_capability');
+      });
+
+      await device.onNodeInit({ node });
+
+      // The probe succeeded but registration did not; persisting verified=true
+      // next to endpointTypes=null would pin the endpoint to null forever
+      expect(device._store.endpointTypesVerified?.[2]).toBeUndefined();
+
+      // Once registration works again, the next init must probe and recover
+      regSpy.mockRestore();
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[2]).toBe(DEVICE_TYPES.SWITCH);
+      expect(device.hasCapability('onoff.ep2')).toBe(true);
+      expect(device._store.endpointTypesVerified[2]).toBe(true);
+    });
+
+    test('cleaning up all endpoints resets the verified flags', async () => {
+      device._endpointTypesVerified = { 2: true };
+
+      await device._cleanupAllEndpoints();
+
+      expect(device._endpointTypesVerified).toEqual({});
+      expect(device._store.endpointTypesVerified).toEqual({});
+    });
+
+    test('keeps the cached type after a probe timeout and retries from the health check', async () => {
+      const node = makeNode({ 1: makeBinaryEndpoint(255) });
+      node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL = makeCommandClassMock({
+        MULTI_CHANNEL_CAPABILITY_GET: jest
+          .fn()
+          .mockRejectedValueOnce(new Error('timeout after 10000ms'))
+          .mockResolvedValue(makeLiveCapabilityReport(1, 16, [0x25])),
+      });
+      device.node = node;
+
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[1]).toBe(DEVICE_TYPES.SWITCH);
+      expect(device._endpointTypesVerified[1]).toBeUndefined();
+
+      await device._checkDeviceHealth();
+
+      expect(device._endpointTypesVerified[1]).toBe(true);
+      expect(device._store.endpointTypesVerified[1]).toBe(true);
+      expect(device._endpointTypes[1]).toBe(DEVICE_TYPES.SWITCH);
+    });
+  });
+
+  describe('duplicate-report desync protection', () => {
+    // Hardware: the panel retransmits every report in bursts (up to 7 copies seen),
+    // and a stale duplicate of one endpoint's report can resolve the next GET
+    test('retries when the probe is answered by another endpoint duplicate', async () => {
+      const node = makeNode({});
+      node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL = makeCommandClassMock({
+        MULTI_CHANNEL_CAPABILITY_GET: jest
+          .fn()
+          .mockResolvedValueOnce(makeLiveCapabilityReport(1, 17, [0x26]))
+          .mockResolvedValue(makeLiveCapabilityReport(2, 16, [0x25])),
+      });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(2)).resolves.toBe(DEVICE_TYPES.SWITCH);
+      expect(
+        node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL.MULTI_CHANNEL_CAPABILITY_GET
+      ).toHaveBeenCalledTimes(2);
+    });
+
+    test('gives up after repeated mismatches and keeps the cached type', async () => {
+      const node = makeNode({});
+      node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL = makeCommandClassMock({
+        MULTI_CHANNEL_CAPABILITY_GET: jest
+          .fn()
+          .mockResolvedValue(makeLiveCapabilityReport(1, 17, [0x26])),
+      });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(2)).resolves.toBeUndefined();
+      expect(
+        node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL.MULTI_CHANNEL_CAPABILITY_GET
+      ).toHaveBeenCalledTimes(WallWandDevice.VERIFY_PROBE_ATTEMPTS);
+      expect(device._liveGenericClasses[2]).toBeUndefined();
+    });
+
+    test('accepts a report that carries no endpoint field', async () => {
+      const node = makeNode({});
+      node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL = makeCommandClassMock({
+        MULTI_CHANNEL_CAPABILITY_GET: jest.fn().mockResolvedValue({
+          'Generic Device Class': 16,
+          'Command Class (Raw)': Buffer.from([0x25]),
+        }),
+      });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(2)).resolves.toBe(DEVICE_TYPES.SWITCH);
+    });
+
+    test('reads the endpoint from the raw Properties1 byte when the parsed field is missing', async () => {
+      const node = makeNode({});
+      node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL = makeCommandClassMock({
+        MULTI_CHANNEL_CAPABILITY_GET: jest
+          .fn()
+          .mockResolvedValueOnce({
+            // EP1 with the dynamic bit set; bits 0-6 carry the endpoint
+            'Properties1 (Raw)': Buffer.from([0x81]),
+            'Generic Device Class': 17,
+            'Command Class (Raw)': Buffer.from([0x26]),
+          })
+          .mockResolvedValue({
+            'Properties1 (Raw)': Buffer.from([0x02]),
+            'Generic Device Class': 16,
+            'Command Class (Raw)': Buffer.from([0x25]),
+          }),
+      });
+      device.node = node;
+
+      await expect(device._verifyEndpointLive(2)).resolves.toBe(DEVICE_TYPES.SWITCH);
+    });
+
+    test('a verify generation bump re-probes endpoints verified by older logic', async () => {
+      const node = makeNode({ 2: makeBinaryEndpoint(0) });
+      addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25]) });
+      device.node = node;
+      // Poisoned store from the buggy generation: verified, but mistyped
+      device._store.endpointTypes = { 2: DEVICE_TYPES.DIMMER };
+      device._store.endpointTypesVerified = { 2: true };
+      device._store.endpointVerifyGeneration = WallWandDevice.VERIFY_GENERATION - 1;
+
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[2]).toBe(DEVICE_TYPES.SWITCH);
+      expect(device._store.endpointVerifyGeneration).toBe(WallWandDevice.VERIFY_GENERATION);
+      expect(device._store.endpointTypesVerified[2]).toBe(true);
+      expect(device.hasCapability('dim.ep2')).toBe(false);
+      expect(device.hasCapability('onoff.ep2')).toBe(true);
+    });
+
+    test('a verify generation bump also reruns the blind state reset', async () => {
+      const node = makeNode({ 1: makeMultilevelEndpoint(0) });
+      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 17, [0x26]) });
+      device.node = node;
+      device._store.endpointTypes = { 1: DEVICE_TYPES.DIMMER };
+      device._store.blindStateResetDone = true;
+      // Fabricated state leaked in under the old generation
+      device._capabilityValues['onoff.ep1'] = false;
+      device._capabilityValues['dim.ep1'] = 0;
+      device._store.endpointVerifyGeneration = WallWandDevice.VERIFY_GENERATION - 1;
+
+      await device.onNodeInit({ node });
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBeNull();
+      expect(device.getCapabilityValue('dim.ep1')).toBeNull();
+      expect(device._store.blindStateResetDone).toBe(true);
+    });
+
+    test('the current verify generation keeps stored verifications', async () => {
+      const node = makeNode({ 2: makeBinaryEndpoint(0) });
+      addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25]) });
+      device.node = node;
+      device._store.endpointTypes = { 2: DEVICE_TYPES.SWITCH };
+      device._store.endpointTypesVerified = { 2: true };
+      device._store.endpointVerifyGeneration = WallWandDevice.VERIFY_GENERATION;
+
+      await device.onNodeInit({ node });
+
+      const probe = node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL.MULTI_CHANNEL_CAPABILITY_GET;
+      expect(probe).not.toHaveBeenCalled();
+      expect(device._endpointTypes[2]).toBe(DEVICE_TYPES.SWITCH);
+    });
+  });
+
+  describe('blind report parsers', () => {
+    // The library writes parsed reports straight into capabilities; for blinds the
+    // panel's 0-reports carry no position, so the parsers must reject them
+    test('ignore the meaningless 0 and 255 reports', () => {
+      expect(device._blindOnoffReportParser({ 'Current Value': 0 })).toBeNull();
+      expect(device._blindOnoffReportParser({ 'Current Value': 'off/disable' })).toBeNull();
+      expect(device._blindDimReportParser({ 'Current Value': 0 })).toBeNull();
+      expect(device._blindDimReportParser({ 'Current Value': 'off/disable' })).toBeNull();
+      expect(device._blindDimReportParser({ 'Current Value': 255 })).toBeNull();
+      expect(device._blindDimReportParser({ 'Current Value': 'on/enable' })).toBeNull();
+      expect(device._blindDimReportParser({})).toBeNull();
+    });
+
+    test('pass real 1-99 levels through', () => {
+      expect(device._blindOnoffReportParser({ 'Current Value': 50 })).toBe(true);
+      expect(device._blindOnoffReportParser({ 'Current Value': 255 })).toBe(true);
+      expect(device._blindOnoffReportParser({ 'Current Value': 'on/enable' })).toBe(true);
+      expect(device._blindDimReportParser({ 'Current Value': 50 })).toBeCloseTo(50 / 99);
+      expect(device._blindDimReportParser({ 'Current Value': 99 })).toBe(1);
+    });
+
+    test('dimmer registration overrides the library report parser', async () => {
+      const regSpy = jest.spyOn(device, 'registerCapability');
+
+      await device._registerEndpointCapabilities(1, DEVICE_TYPES.DIMMER, {
+        COMMAND_CLASS_SWITCH_MULTILEVEL: makeCommandClassMock(),
+      });
+
+      for (const cap of ['onoff.ep1', 'dim.ep1']) {
+        const call = regSpy.mock.calls.find(c => c[0] === cap);
+        expect(call).toBeDefined();
+        expect(typeof call[2].reportParser).toBe('function');
+        // Without the explicit override flag the library's version-specific
+        // parsers (reportParserV4) still win and write the 0-reports
+        expect(call[2].reportParserOverride).toBe(true);
+      }
+    });
+
+    test('the BASIC fallback registration also overrides the report parser', async () => {
+      const regSpy = jest.spyOn(device, 'registerCapability');
+
+      await device._registerEndpointCapabilities(1, DEVICE_TYPES.DIMMER, {
+        COMMAND_CLASS_BASIC: makeCommandClassMock(),
+      });
+
+      const call = regSpy.mock.calls.find(c => c[0] === 'dim.ep1' && c[1] === 'BASIC');
+      expect(call).toBeDefined();
+      expect(typeof call[2].reportParser).toBe('function');
+      expect(call[2].reportParserOverride).toBe(true);
+    });
+
+    test('switch registration keeps the library report parser', async () => {
+      const regSpy = jest.spyOn(device, 'registerCapability');
+
+      await device._registerEndpointCapabilities(3, DEVICE_TYPES.SWITCH, {
+        COMMAND_CLASS_SWITCH_BINARY: makeCommandClassMock(),
+      });
+
+      const call = regSpy.mock.calls.find(c => c[0] === 'onoff.ep3');
+      expect(call).toBeDefined();
+      expect(call[2].reportParser).toBeUndefined();
+    });
+  });
+
+  describe('capability registration fallbacks', () => {
+    test('registers dimmer capabilities against BASIC when the cache lacks SWITCH_MULTILEVEL', async () => {
+      const regSpy = jest.spyOn(device, 'registerCapability');
+
+      await device._registerEndpointCapabilities(1, DEVICE_TYPES.DIMMER, {
+        COMMAND_CLASS_BASIC: makeCommandClassMock(),
+      });
+
+      expect(regSpy).toHaveBeenCalledWith(
+        'onoff.ep1',
+        'BASIC',
+        expect.objectContaining({ getOpts: { getOnStart: false } })
+      );
+      expect(regSpy).toHaveBeenCalledWith(
+        'dim.ep1',
+        'BASIC',
+        expect.objectContaining({ getOpts: { getOnStart: false } })
+      );
+    });
+
+    test('skips registration without crashing when the cache lacks the typed CC and BASIC', async () => {
+      const regSpy = jest.spyOn(device, 'registerCapability');
+
+      await device._registerEndpointCapabilities(1, DEVICE_TYPES.SWITCH, {});
+
+      expect(regSpy).not.toHaveBeenCalled();
+      expect(device.hasCapability('onoff.ep1')).toBe(true);
+    });
+  });
+
+  describe('multilevel value normalization', () => {
+    test('maps the core string names to their byte values', () => {
+      expect(device._normalizeMultilevelValue('off/disable')).toBe(0);
+      expect(device._normalizeMultilevelValue('on/enable')).toBe(255);
+    });
+
+    test('passes finite numbers through', () => {
+      expect(device._normalizeMultilevelValue(0)).toBe(0);
+      expect(device._normalizeMultilevelValue(50)).toBe(50);
+      expect(device._normalizeMultilevelValue(255)).toBe(255);
+    });
+
+    test('returns undefined for anything else', () => {
+      expect(device._normalizeMultilevelValue('something')).toBeUndefined();
+      expect(device._normalizeMultilevelValue(NaN)).toBeUndefined();
+      expect(device._normalizeMultilevelValue(null)).toBeUndefined();
+      expect(device._normalizeMultilevelValue(undefined)).toBeUndefined();
+      expect(device._normalizeMultilevelValue(true)).toBeUndefined();
+    });
+  });
+
+  describe('blind state sync', () => {
+    beforeEach(async () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.DIMMER };
+      await device.addCapability('onoff.ep1');
+      await device.addCapability('dim.ep1');
+    });
+
+    test('a 0 report counts as success but writes nothing', async () => {
+      // These blinds report 0 regardless of position, so 0 only proves liveness
+      await device.setCapabilityValue('onoff.ep1', true);
+      await device.setCapabilityValue('dim.ep1', 0.7);
+      device._syncFailureCounts[1] = 2;
+
+      await device._syncOneEndpointState(1, makeMultilevelEndpoint('off/disable'));
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
+      expect(device.getCapabilityValue('dim.ep1')).toBe(0.7);
+      expect(device._syncFailureCounts[1]).toBe(0);
+    });
+
+    test('a numeric 0 report also writes nothing', async () => {
+      await device.setCapabilityValue('onoff.ep1', true);
+      await device.setCapabilityValue('dim.ep1', 0.7);
+
+      await device._syncOneEndpointState(1, makeMultilevelEndpoint(0));
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
+      expect(device.getCapabilityValue('dim.ep1')).toBe(0.7);
+    });
+
+    test('a 1-99 report writes onoff and dim', async () => {
+      await device._syncOneEndpointState(1, makeMultilevelEndpoint(50));
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
+      expect(device.getCapabilityValue('dim.ep1')).toBeCloseTo(50 / 99);
+    });
+
+    test('a 255 report writes onoff only', async () => {
+      await device.setCapabilityValue('dim.ep1', 0.3);
+
+      await device._syncOneEndpointState(1, makeMultilevelEndpoint('on/enable'));
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
+      expect(device.getCapabilityValue('dim.ep1')).toBe(0.3);
+    });
+  });
+
+  describe('switch state sync', () => {
+    // Re-typed endpoints (Entrance EP2) keep the stale interview cache, which
+    // lists BASIC but not SWITCH_BINARY
+    function makeStaleCacheSwitchEndpoint(basicReport) {
+      return {
+        deviceClassGeneric: 'GENERIC_TYPE_SWITCH_MULTILEVEL',
+        CommandClass: {
+          COMMAND_CLASS_BASIC: makeCommandClassMock({
+            BASIC_GET: jest.fn().mockResolvedValue(basicReport),
+          }),
+          COMMAND_CLASS_SWITCH_MULTILEVEL: makeCommandClassMock(),
+        },
+      };
+    }
+
+    beforeEach(async () => {
+      device._endpointTypes = { 2: DEVICE_TYPES.SWITCH };
+      await device.addCapability('onoff.ep2');
+    });
+
+    test('falls back to BASIC_GET when the stale cache lacks SWITCH_BINARY', async () => {
+      await device._syncOneEndpointState(2, makeStaleCacheSwitchEndpoint({ Value: 255 }));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+    });
+
+    test('BASIC fallback applies off reports too', async () => {
+      await device.setCapabilityValue('onoff.ep2', true);
+
+      await device._syncOneEndpointState(2, makeStaleCacheSwitchEndpoint({ Value: 'off/disable' }));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(false);
+    });
+
+    test('leaves state alone when neither SWITCH_BINARY nor BASIC can be read', async () => {
+      await device.setCapabilityValue('onoff.ep2', true);
+      const endpoint = {
+        deviceClassGeneric: 'GENERIC_TYPE_SWITCH_MULTILEVEL',
+        CommandClass: { COMMAND_CLASS_SWITCH_MULTILEVEL: makeCommandClassMock() },
+      };
+
+      await device._syncOneEndpointState(2, endpoint);
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+    });
+  });
+
+  describe('one-time blind state reset', () => {
+    test('nulls dimmer capabilities exactly once and fires no triggers', async () => {
+      const node = makeNode({ 1: makeMultilevelEndpoint('off/disable') });
+      device.node = node;
+      // Simulate fabricated state left behind by older versions
+      device._store.endpointTypes = { 1: DEVICE_TYPES.DIMMER };
+      await device.addCapability('onoff.ep1');
+      await device.addCapability('dim.ep1');
+      await device.setCapabilityValue('onoff.ep1', false);
+      await device.setCapabilityValue('dim.ep1', 0);
+
+      await device.onNodeInit({ node });
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBeNull();
+      expect(device.getCapabilityValue('dim.ep1')).toBeNull();
+      expect(device._store.blindStateResetDone).toBe(true);
+      for (const card of device._triggerCards.values()) {
+        expect(card.trigger).not.toHaveBeenCalled();
+      }
+
+      // A later init must not clobber state again
+      await device.setCapabilityValue('onoff.ep1', true);
+      await device.setCapabilityValue('dim.ep1', 0.5);
+      await device.onNodeInit({ node });
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
+      expect(device.getCapabilityValue('dim.ep1')).toBe(0.5);
+    });
+  });
+
+  describe('blind labels', () => {
+    test('dimmer endpoints default to a Blind label', () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.DIMMER };
+
+      expect(device._getEndpointLabel(1)).toBe('Blind 1');
     });
   });
 });
