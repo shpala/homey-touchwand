@@ -13,5 +13,8 @@
   },
   "0.1.4": {
     "en": "Stability improvements"
+  },
+  "0.1.5": {
+    "en": "Fixed the 'Endpoint state changed' flow trigger, fixed endpoint autocomplete when multiple panels are paired, faster and quieter startup"
   }
 }

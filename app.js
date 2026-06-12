@@ -7,6 +7,24 @@ class TouchWandApp extends Homey.App {
     this.log('TouchWand app has been initialized');
     this._registerActionCards();
     this._registerConditionCards();
+    this._registerTriggerCards();
+  }
+
+  _registerTriggerCards() {
+    const triggerIds = [
+      ['endpoint_turned_on', false],
+      ['endpoint_turned_off', false],
+      ['endpoint_dim_changed', true],
+      ['endpoint_state_changed', false],
+    ];
+
+    for (const [triggerId, onlyDimmers] of triggerIds) {
+      const card = this.homey.flow.getDeviceTriggerCard(triggerId);
+      if (!card) continue;
+      card.registerArgumentAutocompleteListener('endpoint', async (query, args) =>
+        args.device._getEndpointAutocompleteList(query, onlyDimmers)
+      );
+    }
   }
 
   _registerActionCards() {
@@ -31,8 +49,7 @@ class TouchWandApp extends Homey.App {
       if (!args.device.hasCapability(cap)) {
         throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
       }
-      const currentState = args.device.getCapabilityValue(cap) ?? false;
-      await args.device.queueCapabilityCommand(cap, !currentState);
+      await args.device.queueToggleCommand(cap);
     });
 
     this._registerAction(

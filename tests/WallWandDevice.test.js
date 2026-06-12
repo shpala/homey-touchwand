@@ -22,6 +22,11 @@ jest.mock('homey-zwavedriver', () => ({
             return this._triggerCards.get(id);
           },
         },
+        // Delegate to the globals so jest fake timers keep working
+        setTimeout: (fn, ms) => setTimeout(fn, ms),
+        clearTimeout: id => clearTimeout(id),
+        setInterval: (fn, ms) => setInterval(fn, ms),
+        clearInterval: id => clearInterval(id),
       };
     }
 
@@ -139,6 +144,18 @@ describe('WallWandDevice', () => {
 
   afterEach(async () => {
     await device.onDeleted();
+  });
+
+  describe('shared flow card registration', () => {
+    test('onInit does not register autocomplete listeners on shared trigger cards', () => {
+      // Trigger cards are singletons shared by all devices; registering a
+      // device-bound autocomplete listener here would let the last paired
+      // panel hijack autocomplete for every other panel. That registration
+      // belongs in app.js where args.device resolves per invocation.
+      for (const card of device._triggerCards.values()) {
+        expect(card.registerArgumentAutocompleteListener).not.toHaveBeenCalled();
+      }
+    });
   });
 
   describe('flow handlers before node init', () => {
@@ -275,7 +292,7 @@ describe('WallWandDevice', () => {
       await device.onNodeInit({ node });
 
       expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
-      const turnedOn = device._triggerCards.get('endpoint_turned_on');
+      const turnedOn = device.homey.flow.getDeviceTriggerCard('endpoint_turned_on');
       expect(turnedOn.trigger).not.toHaveBeenCalled();
     });
 
@@ -286,8 +303,170 @@ describe('WallWandDevice', () => {
 
       await device._setOnOff('onoff.ep1', false, 1);
 
-      const turnedOff = device._triggerCards.get('endpoint_turned_off');
+      const turnedOff = device.homey.flow.getDeviceTriggerCard('endpoint_turned_off');
       expect(turnedOff.trigger).toHaveBeenCalled();
+    });
+  });
+
+  describe('endpoint labels', () => {
+    test('flow token labels are sanitized the same way as capability titles', () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.SWITCH };
+      device._settings.label_ep1 = `  <b>${'x'.repeat(60)}</b>  `;
+
+      const label = device._getEndpointLabel(1);
+
+      expect(label).not.toMatch(/[<>]/);
+      expect(label.length).toBeLessThanOrEqual(50);
+    });
+
+    test('empty custom label falls back to the default', () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.SWITCH };
+      device._settings.label_ep1 = '   ';
+
+      expect(device._getEndpointLabel(1)).toBe('Switch 1');
+    });
+  });
+
+  describe('queued toggle', () => {
+    test('reads current state at execution time, not enqueue time', async () => {
+      await device.addCapability('onoff.ep1');
+      await device.setCapabilityValue('onoff.ep1', false);
+      jest
+        .spyOn(device, 'triggerCapabilityListener')
+        .mockImplementation(async (cap, value) => device.setCapabilityValue(cap, value));
+
+      // Two rapid toggles must land on opposite values, not both on true
+      await Promise.all([
+        device.queueToggleCommand('onoff.ep1'),
+        device.queueToggleCommand('onoff.ep1'),
+      ]);
+
+      expect(device.triggerCapabilityListener).toHaveBeenNthCalledWith(1, 'onoff.ep1', true);
+      expect(device.triggerCapabilityListener).toHaveBeenNthCalledWith(2, 'onoff.ep1', false);
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(false);
+    });
+  });
+
+  describe('capability registration', () => {
+    test('registers capabilities without firing a startup GET', async () => {
+      // The initial state read is owned by _syncAllEndpointStates; letting
+      // registerCapability also GET on start doubles the Z-Wave traffic.
+      const regSpy = jest.spyOn(device, 'registerCapability');
+      const node = makeNode({ 1: makeBinaryEndpoint(255), 2: makeMultilevelEndpoint(50) });
+      device.node = node;
+
+      await device.onNodeInit({ node });
+
+      expect(regSpy).toHaveBeenCalled();
+      for (const call of regSpy.mock.calls) {
+        expect(call[2]).toMatchObject({ getOpts: { getOnStart: false } });
+      }
+    });
+  });
+
+  describe('managed timers', () => {
+    test('health check interval goes through this.homey', () => {
+      const intervalSpy = jest.spyOn(device.homey, 'setInterval');
+
+      device._startHealthCheck();
+
+      expect(intervalSpy).toHaveBeenCalledWith(
+        expect.any(Function),
+        WallWandDevice.HEALTH_CHECK_INTERVAL_MS
+      );
+    });
+
+    test('root report debounce timer goes through this.homey', async () => {
+      const node = makeNode({ 1: makeBinaryEndpoint(255) });
+      device.node = node;
+      await device.onNodeInit({ node });
+      const timeoutSpy = jest.spyOn(device.homey, 'setTimeout');
+      jest.spyOn(device, '_syncEndpointsByType').mockResolvedValue();
+
+      const listener = node.CommandClass.COMMAND_CLASS_SWITCH_BINARY.on.mock.calls[0][1];
+      await listener();
+
+      expect(timeoutSpy).toHaveBeenCalledWith(
+        expect.any(Function),
+        WallWandDevice.SYNC_DEBOUNCE_MS
+      );
+    });
+  });
+
+  describe('root report debounce', () => {
+    let node;
+
+    beforeEach(async () => {
+      node = makeNode({
+        1: makeBinaryEndpoint(255),
+        2: makeMultilevelEndpoint(50),
+      });
+      device.node = node;
+      await device.onNodeInit({ node });
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    function getRootListener(commandClassId) {
+      const cc = node.CommandClass[commandClassId];
+      expect(cc.on).toHaveBeenCalledWith('report', expect.any(Function));
+      return cc.on.mock.calls[0][1];
+    }
+
+    test('does not sync before the debounce window elapses', async () => {
+      const syncSpy = jest.spyOn(device, '_syncEndpointsByType').mockResolvedValue();
+      const listener = getRootListener('COMMAND_CLASS_SWITCH_BINARY');
+
+      await listener();
+      await jest.advanceTimersByTimeAsync(WallWandDevice.SYNC_DEBOUNCE_MS - 1);
+
+      expect(syncSpy).not.toHaveBeenCalled();
+    });
+
+    test('syncs only endpoints of the reported type after the debounce window', async () => {
+      const syncSpy = jest.spyOn(device, '_syncEndpointsByType').mockResolvedValue();
+      const listener = getRootListener('COMMAND_CLASS_SWITCH_BINARY');
+
+      await listener();
+      await jest.advanceTimersByTimeAsync(WallWandDevice.SYNC_DEBOUNCE_MS);
+
+      expect(syncSpy).toHaveBeenCalledTimes(1);
+      expect(syncSpy).toHaveBeenCalledWith(DEVICE_TYPES.SWITCH);
+    });
+
+    test('a repeated root report within the window restarts the debounce', async () => {
+      const syncSpy = jest.spyOn(device, '_syncEndpointsByType').mockResolvedValue();
+      const listener = getRootListener('COMMAND_CLASS_SWITCH_MULTILEVEL');
+
+      await listener();
+      await jest.advanceTimersByTimeAsync(WallWandDevice.SYNC_DEBOUNCE_MS - 50);
+      await listener();
+      await jest.advanceTimersByTimeAsync(WallWandDevice.SYNC_DEBOUNCE_MS - 50);
+
+      expect(syncSpy).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(50);
+
+      expect(syncSpy).toHaveBeenCalledTimes(1);
+      expect(syncSpy).toHaveBeenCalledWith(DEVICE_TYPES.DIMMER);
+    });
+
+    test('debounced sync polls the endpoint and updates capability values', async () => {
+      node.MultiChannelNodes[1].CommandClass.COMMAND_CLASS_SWITCH_BINARY.SWITCH_BINARY_GET = jest
+        .fn()
+        .mockResolvedValue({ 'Current Value': 'off/disable' });
+      const listener = getRootListener('COMMAND_CLASS_SWITCH_BINARY');
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
+
+      await listener();
+      await jest.advanceTimersByTimeAsync(WallWandDevice.SYNC_DEBOUNCE_MS);
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(false);
+      expect(device.getCapabilityValue('dim.ep2')).toBe(50 / 99);
     });
   });
 

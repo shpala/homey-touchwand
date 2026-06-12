@@ -9,7 +9,7 @@
   "category": [
     "tools"
   ],
-  "version": "0.1.4",
+  "version": "0.1.5",
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "platforms": [
@@ -22,97 +22,5 @@
     "large": "/assets/icon_large.png",
     "small": "/assets/icon_small.png",
     "xlarge": "/assets/icon_xlarge.png"
-  },
-  "flow": {
-    "triggers": [
-      {
-        "id": "endpoint_turned_on",
-        "title": {
-          "en": "Endpoint turned on"
-        },
-        "titleFormatted": {
-          "en": "[[endpoint]] turned on"
-        },
-        "hint": {
-          "en": "Triggered when a specific endpoint is turned on"
-        },
-        "args": [
-          {
-            "name": "device",
-            "type": "device",
-            "filter": "driver_id=wallwand"
-          },
-          {
-            "name": "endpoint",
-            "type": "autocomplete",
-            "title": {
-              "en": "Endpoint"
-            }
-          }
-        ]
-      },
-      {
-        "id": "endpoint_turned_off",
-        "title": {
-          "en": "Endpoint turned off"
-        },
-        "titleFormatted": {
-          "en": "[[endpoint]] turned off"
-        },
-        "hint": {
-          "en": "Triggered when a specific endpoint is turned off"
-        },
-        "args": [
-          {
-            "name": "device",
-            "type": "device",
-            "filter": "driver_id=wallwand"
-          },
-          {
-            "name": "endpoint",
-            "type": "autocomplete",
-            "title": {
-              "en": "Endpoint"
-            }
-          }
-        ]
-      },
-      {
-        "id": "endpoint_dim_changed",
-        "title": {
-          "en": "Endpoint dimmer changed"
-        },
-        "titleFormatted": {
-          "en": "[[endpoint]] dim level changed"
-        },
-        "hint": {
-          "en": "Triggered when a dimmer endpoint's brightness changes"
-        },
-        "args": [
-          {
-            "name": "device",
-            "type": "device",
-            "filter": "driver_id=wallwand"
-          },
-          {
-            "name": "endpoint",
-            "type": "autocomplete",
-            "title": {
-              "en": "Endpoint"
-            }
-          }
-        ],
-        "tokens": [
-          {
-            "name": "dim_value",
-            "type": "number",
-            "title": {
-              "en": "Brightness"
-            },
-            "example": 0.5
-          }
-        ]
-      }
-    ]
   }
 }

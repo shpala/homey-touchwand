@@ -1,0 +1,188 @@
+{
+  "triggers": [
+    {
+      "id": "endpoint_turned_on",
+      "title": {
+        "en": "Endpoint turned on"
+      },
+      "titleFormatted": {
+        "en": "[[endpoint]] turned on"
+      },
+      "hint": {
+        "en": "Triggered when a specific endpoint is turned on"
+      },
+      "args": [
+        {
+          "type": "autocomplete",
+          "name": "endpoint",
+          "title": {
+            "en": "Endpoint"
+          },
+          "placeholder": {
+            "en": "Select endpoint"
+          }
+        }
+      ],
+      "tokens": [
+        {
+          "name": "endpoint_id",
+          "type": "number",
+          "title": {
+            "en": "Endpoint ID"
+          },
+          "example": 1
+        },
+        {
+          "name": "endpoint_label",
+          "type": "string",
+          "title": {
+            "en": "Endpoint Label"
+          },
+          "example": "Living Room Light"
+        }
+      ]
+    },
+    {
+      "id": "endpoint_turned_off",
+      "title": {
+        "en": "Endpoint turned off"
+      },
+      "titleFormatted": {
+        "en": "[[endpoint]] turned off"
+      },
+      "hint": {
+        "en": "Triggered when a specific endpoint is turned off"
+      },
+      "args": [
+        {
+          "type": "autocomplete",
+          "name": "endpoint",
+          "title": {
+            "en": "Endpoint"
+          },
+          "placeholder": {
+            "en": "Select endpoint"
+          }
+        }
+      ],
+      "tokens": [
+        {
+          "name": "endpoint_id",
+          "type": "number",
+          "title": {
+            "en": "Endpoint ID"
+          },
+          "example": 1
+        },
+        {
+          "name": "endpoint_label",
+          "type": "string",
+          "title": {
+            "en": "Endpoint Label"
+          },
+          "example": "Living Room Light"
+        }
+      ]
+    },
+    {
+      "id": "endpoint_dim_changed",
+      "title": {
+        "en": "Endpoint dimmer changed"
+      },
+      "titleFormatted": {
+        "en": "[[endpoint]] dimmer changed"
+      },
+      "hint": {
+        "en": "Triggered when a dimmer endpoint's brightness changes"
+      },
+      "args": [
+        {
+          "type": "autocomplete",
+          "name": "endpoint",
+          "title": {
+            "en": "Endpoint"
+          },
+          "placeholder": {
+            "en": "Select endpoint"
+          }
+        }
+      ],
+      "tokens": [
+        {
+          "name": "endpoint_id",
+          "type": "number",
+          "title": {
+            "en": "Endpoint ID"
+          },
+          "example": 1
+        },
+        {
+          "name": "endpoint_label",
+          "type": "string",
+          "title": {
+            "en": "Endpoint Label"
+          },
+          "example": "Living Room Light"
+        },
+        {
+          "name": "dim_value",
+          "type": "number",
+          "title": {
+            "en": "Brightness"
+          },
+          "example": 0.5
+        }
+      ]
+    },
+    {
+      "id": "endpoint_state_changed",
+      "title": {
+        "en": "Endpoint state changed"
+      },
+      "titleFormatted": {
+        "en": "[[endpoint]] state changed"
+      },
+      "hint": {
+        "en": "Triggered when an endpoint changes state (on/off)"
+      },
+      "args": [
+        {
+          "type": "autocomplete",
+          "name": "endpoint",
+          "title": {
+            "en": "Endpoint"
+          },
+          "placeholder": {
+            "en": "Select endpoint"
+          }
+        }
+      ],
+      "tokens": [
+        {
+          "name": "endpoint_id",
+          "type": "number",
+          "title": {
+            "en": "Endpoint ID"
+          },
+          "example": 1
+        },
+        {
+          "name": "endpoint_label",
+          "type": "string",
+          "title": {
+            "en": "Endpoint Label"
+          },
+          "example": "Living Room Light"
+        },
+        {
+          "name": "state",
+          "type": "boolean",
+          "title": {
+            "en": "State"
+          },
+          "example": true
+        }
+      ]
+    }
+  ]
+}

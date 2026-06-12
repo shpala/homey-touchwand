@@ -2,6 +2,7 @@ node_modules/
 .homeybuild/
 app.json
 package-lock.json
+coverage/
 
 # local tool caches
 .codesage/
@@ -11,3 +12,4 @@ package-lock.json
 .sqry/
 .claude/
 blog-post-revised.md
+audit-2026-06.md

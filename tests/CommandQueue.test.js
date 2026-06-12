@@ -15,9 +15,7 @@ describe('CommandQueue', () => {
       log: mockLog,
       error: mockError,
     };
-    queue = new CommandQueue(mockLogger);
-    queue.setDelay(10); // Short delay for tests
-    queue.setCommandTimeout(100); // Short timeout for tests
+    queue = new CommandQueue(mockLogger, 10, 100); // Short delay and timeout for tests
   });
 
   test('should execute a single command', async () => {
@@ -70,6 +68,29 @@ describe('CommandQueue', () => {
     expect(executor).toHaveBeenCalled();
   });
 
+  test('clear rejects pending commands without touching the one in flight', async () => {
+    let resolveFirst;
+    const executor1 = jest.fn().mockImplementation(
+      () =>
+        new Promise(resolve => {
+          resolveFirst = resolve;
+        })
+    );
+    const executor2 = jest.fn().mockResolvedValue('success');
+
+    const p1 = queue.add(executor1, 'In Flight');
+    const p2 = queue.add(executor2, 'Pending');
+
+    await Promise.resolve();
+    queue.clear();
+
+    await expect(p2).rejects.toThrow('Queue cleared');
+    expect(executor2).not.toHaveBeenCalled();
+
+    resolveFirst();
+    await expect(p1).resolves.toBeUndefined();
+  });
+
   test('should timeout slow commands', async () => {
     const executor = jest.fn().mockImplementation(async () => {
       return new Promise(resolve => setTimeout(resolve, 200)); // finishes in 200ms, timeout is 100ms
@@ -77,5 +98,52 @@ describe('CommandQueue', () => {
 
     await expect(queue.add(executor, 'Slow Cmd')).rejects.toThrow(/timed out/);
     expect(mockError).toHaveBeenCalledWith(expect.stringContaining('Failed: Slow Cmd'));
+  });
+
+  test('accepts delay and timeout via constructor', async () => {
+    const q = new CommandQueue(mockLogger, 5, 50);
+    const executor = () => new Promise(resolve => setTimeout(resolve, 200));
+
+    await expect(q.add(executor, 'Slow Cmd')).rejects.toThrow(/timed out after 50ms/);
+  });
+
+  test('logs a warning when a timed-out command resolves late', async () => {
+    let resolveLate;
+    const executor = () =>
+      new Promise(resolve => {
+        resolveLate = resolve;
+      });
+
+    await expect(queue.add(executor, 'Slow Cmd')).rejects.toThrow(/timed out/);
+    expect(mockLog).not.toHaveBeenCalledWith(expect.stringContaining('late'));
+
+    resolveLate();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(mockLog).toHaveBeenCalledWith(expect.stringContaining('resolved late'));
+  });
+
+  test('logs a warning when a timed-out command rejects late', async () => {
+    let rejectLate;
+    const executor = () =>
+      new Promise((_, reject) => {
+        rejectLate = reject;
+      });
+
+    await expect(queue.add(executor, 'Slow Cmd')).rejects.toThrow(/timed out/);
+
+    rejectLate(new Error('NO_ACK'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(mockLog).toHaveBeenCalledWith(expect.stringContaining('rejected late'));
+  });
+
+  test('does not log a late warning when the executor itself rejected', async () => {
+    const executor = jest.fn().mockRejectedValue(new Error('Fail'));
+
+    await expect(queue.add(executor, 'Fail Cmd')).rejects.toThrow('Fail');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(mockLog).not.toHaveBeenCalledWith(expect.stringContaining('late'));
   });
 });

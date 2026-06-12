@@ -1,20 +1,12 @@
 'use strict';
 
 class CommandQueue {
-  constructor(logger) {
+  constructor(logger, delayMs = 250, timeoutMs = 10000) {
     this.logger = logger;
     this._queue = [];
     this._isProcessing = false;
-    this.COMMAND_DELAY_MS = 300; // Default delay
-    this.COMMAND_TIMEOUT_MS = 10000; // Default timeout (10s)
-  }
-
-  setDelay(ms) {
-    this.COMMAND_DELAY_MS = ms;
-  }
-
-  setCommandTimeout(ms) {
-    this.COMMAND_TIMEOUT_MS = ms;
+    this.COMMAND_DELAY_MS = delayMs;
+    this.COMMAND_TIMEOUT_MS = timeoutMs;
   }
 
   clear() {
@@ -58,13 +50,28 @@ class CommandQueue {
 
         const command = this._queue.shift();
 
+        let execution;
         try {
           this.logger.log(`[QUEUE] Processing: ${command.description}`);
-          await this._withTimeout(command.executor(), this.COMMAND_TIMEOUT_MS);
+          execution = Promise.resolve(command.executor());
+          await this._withTimeout(execution, this.COMMAND_TIMEOUT_MS);
           command.resolve();
         } catch (error) {
           command.reject(error);
           this.logger.error(`[QUEUE] Failed: ${command.description} - ${error.message || error}`);
+
+          // On timeout the underlying Z-Wave command is still running and may
+          // overlap with the next one; we can't cancel it, but make it visible
+          if (error.isTimeout && execution) {
+            execution.then(
+              () =>
+                this.logger.log(`[QUEUE] Timed-out command resolved late: ${command.description}`),
+              err =>
+                this.logger.log(
+                  `[QUEUE] Timed-out command rejected late: ${command.description} - ${err?.message || err}`
+                )
+            );
+          }
         }
 
         if (this._queue.length > 0) {
@@ -84,7 +91,9 @@ class CommandQueue {
     let timeoutId;
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => {
-        reject(new Error(`Command timed out after ${ms}ms`));
+        const error = new Error(`Command timed out after ${ms}ms`);
+        error.isTimeout = true;
+        reject(error);
       }, ms);
     });
 
