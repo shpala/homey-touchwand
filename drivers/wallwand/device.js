@@ -55,6 +55,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
 
     try {
       this._registerRootDeviceListeners(node);
+      this._registerEndpointBasicListeners(node);
 
       await this._discoverAllEndpoints(node);
       await this._syncAllEndpointStates(node);
@@ -202,6 +203,61 @@ module.exports = class WallWandDevice extends ZwaveDevice {
         }
       }, WallWandDevice.SYNC_DEBOUNCE_MS);
     };
+  }
+
+  // Physical presses arrive as multi-channel encapsulated BASIC_SET frames whose
+  // source endpoint identifies what changed, so they can be applied directly
+  // without the poll-everything debounce
+  _registerEndpointBasicListeners(node) {
+    const endpoints = node?.MultiChannelNodes || {};
+    let count = 0;
+
+    for (const id of Object.keys(endpoints)) {
+      const endpointNum = parseInt(id, 10);
+      const cc = endpoints[id]?.CommandClass?.COMMAND_CLASS_BASIC;
+      if (!cc || Number.isNaN(endpointNum) || endpointNum < 1) continue;
+
+      cc.on('report', (command, report) =>
+        this._onEndpointBasicSet(endpointNum, command, report).catch(err => {
+          this.error(`[BASIC] EP${endpointNum} report handling failed:`, err.message || err);
+        })
+      );
+      count++;
+    }
+
+    this.log(`[LISTENERS] BASIC_SET listeners registered on ${count} endpoint(s)`);
+  }
+
+  async _onEndpointBasicSet(endpointNum, command, report) {
+    if (command?.name !== 'BASIC_SET') return;
+    if (!report || typeof report !== 'object' || report.Value == null) return;
+
+    const deviceType = this._endpointTypes[endpointNum];
+    if (!deviceType) return;
+
+    const value = report.Value;
+    this.log(`[BASIC] EP${endpointNum} BASIC_SET value=${value}`);
+
+    const onoffCap = `onoff.ep${endpointNum}`;
+    const dimCap = `dim.ep${endpointNum}`;
+
+    if (deviceType === WallWandDevice.DEVICE_TYPES.SWITCH) {
+      await this._setOnOff(onoffCap, value > 0, endpointNum);
+      return;
+    }
+
+    // Dimmer turned on to its previous level; the level has to be read back
+    if (value === 255) {
+      await this._setOnOff(onoffCap, true, endpointNum);
+      const endpoint = this.node?.MultiChannelNodes?.[endpointNum];
+      if (endpoint) {
+        await this._syncOneEndpointState(endpointNum, endpoint);
+      }
+      return;
+    }
+
+    await this._setOnOff(onoffCap, value > 0, endpointNum);
+    await this._setDim(dimCap, value / WallWandDevice.Z_WAVE_MAX_DIM_VALUE, endpointNum);
   }
 
   _registerRootDeviceListeners(node) {

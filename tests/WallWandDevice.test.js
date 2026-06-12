@@ -106,6 +106,7 @@ function makeBinaryEndpoint(reportValue) {
   return {
     deviceClassGeneric: 'GENERIC_TYPE_SWITCH_BINARY',
     CommandClass: {
+      COMMAND_CLASS_BASIC: makeCommandClassMock(),
       COMMAND_CLASS_SWITCH_BINARY: makeCommandClassMock({
         SWITCH_BINARY_GET: jest.fn().mockResolvedValue({ 'Current Value': reportValue }),
       }),
@@ -117,6 +118,7 @@ function makeMultilevelEndpoint(reportValue) {
   return {
     deviceClassGeneric: 'GENERIC_TYPE_SWITCH_MULTILEVEL',
     CommandClass: {
+      COMMAND_CLASS_BASIC: makeCommandClassMock(),
       COMMAND_CLASS_SWITCH_MULTILEVEL: makeCommandClassMock({
         SWITCH_MULTILEVEL_GET: jest.fn().mockResolvedValue({ 'Current Value': reportValue }),
       }),
@@ -390,6 +392,77 @@ describe('WallWandDevice', () => {
         expect.any(Function),
         WallWandDevice.SYNC_DEBOUNCE_MS
       );
+    });
+  });
+
+  describe('endpoint BASIC_SET reports', () => {
+    let node;
+
+    function getBasicListener(endpointNum) {
+      const cc = node.MultiChannelNodes[endpointNum].CommandClass.COMMAND_CLASS_BASIC;
+      expect(cc.on).toHaveBeenCalledWith('report', expect.any(Function));
+      return cc.on.mock.calls[0][1];
+    }
+
+    beforeEach(async () => {
+      node = makeNode({
+        1: makeMultilevelEndpoint(50),
+        2: makeBinaryEndpoint(0),
+      });
+      device.node = node;
+      await device.onNodeInit({ node });
+    });
+
+    test('BASIC_SET 255 on a switch endpoint turns it on and fires triggers', async () => {
+      const listener = getBasicListener(2);
+
+      await listener({ name: 'BASIC_SET' }, { Value: 255 });
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+      const turnedOn = device.homey.flow.getDeviceTriggerCard('endpoint_turned_on');
+      expect(turnedOn.trigger).toHaveBeenCalled();
+    });
+
+    test('BASIC_SET 0 on a switch endpoint turns it off', async () => {
+      await device.setCapabilityValue('onoff.ep2', true);
+      const listener = getBasicListener(2);
+
+      await listener({ name: 'BASIC_SET' }, { Value: 0 });
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(false);
+      const turnedOff = device.homey.flow.getDeviceTriggerCard('endpoint_turned_off');
+      expect(turnedOff.trigger).toHaveBeenCalled();
+    });
+
+    test('BASIC_SET with a level on a dimmer endpoint sets onoff and dim', async () => {
+      const listener = getBasicListener(1);
+
+      await listener({ name: 'BASIC_SET' }, { Value: 75 });
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
+      expect(device.getCapabilityValue('dim.ep1')).toBeCloseTo(75 / 99);
+    });
+
+    test('BASIC_SET 255 on a dimmer endpoint turns it on and re-reads the level', async () => {
+      node.MultiChannelNodes[1].CommandClass.COMMAND_CLASS_SWITCH_MULTILEVEL.SWITCH_MULTILEVEL_GET =
+        jest.fn().mockResolvedValue({ 'Current Value': 80 });
+      const listener = getBasicListener(1);
+
+      await listener({ name: 'BASIC_SET' }, { Value: 255 });
+
+      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
+      expect(device.getCapabilityValue('dim.ep1')).toBeCloseTo(80 / 99);
+    });
+
+    test('non-SET basic reports and invalid values are ignored', async () => {
+      await device.setCapabilityValue('onoff.ep2', true);
+      const listener = getBasicListener(2);
+
+      await listener({ name: 'BASIC_REPORT' }, { Value: 0 });
+      await listener({ name: 'BASIC_SET' }, {});
+      await listener({ name: 'BASIC_SET' }, null);
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
     });
   });
 
