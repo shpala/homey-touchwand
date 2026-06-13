@@ -2,6 +2,9 @@
 
 const Homey = require('homey');
 
+const BLIND = 'blind';
+const SWITCH = 'switch';
+
 class TouchWandApp extends Homey.App {
   async onInit() {
     this.log('TouchWand app has been initialized');
@@ -11,75 +14,104 @@ class TouchWandApp extends Homey.App {
   }
 
   _registerTriggerCards() {
+    // [triggerId, typeFilter]; deprecated dim card filters to blind so its
+    // autocomplete lists nothing (no endpoint has a dim capability anymore)
     const triggerIds = [
-      ['endpoint_turned_on', false],
-      ['endpoint_turned_off', false],
-      ['endpoint_dim_changed', true],
-      ['endpoint_state_changed', false],
+      ['endpoint_turned_on', SWITCH],
+      ['endpoint_turned_off', SWITCH],
+      ['endpoint_dim_changed', BLIND],
+      ['endpoint_state_changed', SWITCH],
+      ['blind_state_changed', BLIND],
     ];
 
-    for (const [triggerId, onlyDimmers] of triggerIds) {
+    for (const [triggerId, typeFilter] of triggerIds) {
       const card = this.homey.flow.getDeviceTriggerCard(triggerId);
       if (!card) continue;
       card.registerArgumentAutocompleteListener('endpoint', async (query, args) =>
-        args.device._getEndpointAutocompleteList(query, onlyDimmers)
+        args.device._getEndpointAutocompleteList(query, typeFilter)
       );
     }
   }
 
   _registerActionCards() {
-    this._registerAction('turn_endpoint_on', async args => {
-      const cap = `onoff.ep${args.endpoint.id}`;
-      if (!args.device.hasCapability(cap)) {
-        throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
-      }
-      await args.device.queueCapabilityCommand(cap, true);
-    });
+    this._registerAction(
+      'turn_endpoint_on',
+      async args => {
+        const cap = `onoff.ep${args.endpoint.id}`;
+        if (!args.device.hasCapability(cap)) {
+          throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
+        }
+        await args.device.queueCapabilityCommand(cap, true);
+      },
+      SWITCH
+    );
 
-    this._registerAction('turn_endpoint_off', async args => {
-      const cap = `onoff.ep${args.endpoint.id}`;
-      if (!args.device.hasCapability(cap)) {
-        throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
-      }
-      await args.device.queueCapabilityCommand(cap, false);
-    });
+    this._registerAction(
+      'turn_endpoint_off',
+      async args => {
+        const cap = `onoff.ep${args.endpoint.id}`;
+        if (!args.device.hasCapability(cap)) {
+          throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
+        }
+        await args.device.queueCapabilityCommand(cap, false);
+      },
+      SWITCH
+    );
 
-    this._registerAction('toggle_endpoint', async args => {
-      const cap = `onoff.ep${args.endpoint.id}`;
-      if (!args.device.hasCapability(cap)) {
-        throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
-      }
-      await args.device.queueToggleCommand(cap);
-    });
+    this._registerAction(
+      'toggle_endpoint',
+      async args => {
+        const cap = `onoff.ep${args.endpoint.id}`;
+        if (!args.device.hasCapability(cap)) {
+          throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
+        }
+        await args.device.queueToggleCommand(cap);
+      },
+      SWITCH
+    );
 
+    // Deprecated: no endpoint carries a dim capability after the blind remodel,
+    // so this errors clearly instead of silently doing nothing.
     this._registerAction(
       'set_endpoint_dim',
       async args => {
         const dimCap = `dim.ep${args.endpoint.id}`;
-        const onoffCap = `onoff.ep${args.endpoint.id}`;
-
         if (!args.device.hasCapability(dimCap)) {
-          throw new Error(`Endpoint ${args.endpoint.id} does not have a dim capability`);
+          throw new Error('This panel has no dimmer endpoints; use the blind cards instead');
         }
-
         await args.device.queueCapabilityCommand(dimCap, args.level);
-
-        // The dim command already switches the load, just mirror onoff locally
-        if (args.device.hasCapability(onoffCap)) {
-          await args.device._setOnOff(onoffCap, args.level > 0, args.endpoint.id);
-        }
       },
-      true
+      BLIND
+    );
+
+    // Blind actions map open -> up, close -> down, stop -> idle and trigger the
+    // single windowcoverings_state listener (which is the one enqueue point).
+    this._registerBlindAction('open_blind', 'up');
+    this._registerBlindAction('close_blind', 'down');
+    this._registerBlindAction('stop_blind', 'idle');
+  }
+
+  _registerBlindAction(id, state) {
+    this._registerAction(
+      id,
+      async args => {
+        const cap = `windowcoverings_state.ep${args.endpoint.id}`;
+        if (!args.device.hasCapability(cap)) {
+          throw new Error(`Endpoint ${args.endpoint.id} is not a blind`);
+        }
+        await args.device.triggerCapabilityListener(cap, state);
+      },
+      BLIND
     );
   }
 
-  _registerAction(id, runListener, onlyDimmers = false) {
+  _registerAction(id, runListener, typeFilter = null) {
     const action = this.homey.flow.getActionCard(id);
     if (!action) return;
 
     action.registerRunListener(runListener);
     action.registerArgumentAutocompleteListener('endpoint', async (query, args) => {
-      return args.device._getEndpointAutocompleteList(query, onlyDimmers);
+      return args.device._getEndpointAutocompleteList(query, typeFilter);
     });
   }
 
@@ -90,10 +122,12 @@ class TouchWandApp extends Homey.App {
         args.device._handleEndpointIsOn({ endpoint: args.endpoint })
       );
       isOnCondition.registerArgumentAutocompleteListener('endpoint', async (query, args) =>
-        args.device._getEndpointAutocompleteList(query)
+        args.device._getEndpointAutocompleteList(query, SWITCH)
       );
     }
 
+    // Deprecated dimmer condition; kept registered so the flow editor and
+    // getConditionCard don't break. Its autocomplete lists no endpoints.
     const dimCompareCondition = this.homey.flow.getConditionCard('endpoint_dim_compare');
     if (dimCompareCondition) {
       dimCompareCondition.registerRunListener(async args =>
@@ -104,7 +138,17 @@ class TouchWandApp extends Homey.App {
         })
       );
       dimCompareCondition.registerArgumentAutocompleteListener('endpoint', async (query, args) =>
-        args.device._getEndpointAutocompleteList(query, true)
+        args.device._getEndpointAutocompleteList(query, BLIND)
+      );
+    }
+
+    const blindStateCondition = this.homey.flow.getConditionCard('blind_state_is');
+    if (blindStateCondition) {
+      blindStateCondition.registerRunListener(async args =>
+        args.device._handleBlindStateIs({ endpoint: args.endpoint, state: args.state })
+      );
+      blindStateCondition.registerArgumentAutocompleteListener('endpoint', async (query, args) =>
+        args.device._getEndpointAutocompleteList(query, BLIND)
       );
     }
   }

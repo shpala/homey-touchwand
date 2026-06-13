@@ -12,16 +12,22 @@
   "capabilities": [
     "onoff.ep1",
     "dim.ep1",
+    "windowcoverings_state.ep1",
     "onoff.ep2",
     "dim.ep2",
+    "windowcoverings_state.ep2",
     "onoff.ep3",
     "dim.ep3",
+    "windowcoverings_state.ep3",
     "onoff.ep4",
     "dim.ep4",
+    "windowcoverings_state.ep4",
     "onoff.ep5",
     "dim.ep5",
+    "windowcoverings_state.ep5",
     "onoff.ep6",
-    "dim.ep6"
+    "dim.ep6",
+    "windowcoverings_state.ep6"
   ],
   "capabilitiesOptions": {
     "onoff.ep1": {
@@ -30,6 +36,11 @@
       }
     },
     "dim.ep1": {
+      "title": {
+        "en": "Blind 1"
+      }
+    },
+    "windowcoverings_state.ep1": {
       "title": {
         "en": "Blind 1"
       }
@@ -44,12 +55,22 @@
         "en": "Blind 2"
       }
     },
+    "windowcoverings_state.ep2": {
+      "title": {
+        "en": "Blind 2"
+      }
+    },
     "onoff.ep3": {
       "title": {
         "en": "Switch 3"
       }
     },
     "dim.ep3": {
+      "title": {
+        "en": "Blind 3"
+      }
+    },
+    "windowcoverings_state.ep3": {
       "title": {
         "en": "Blind 3"
       }
@@ -64,6 +85,11 @@
         "en": "Blind 4"
       }
     },
+    "windowcoverings_state.ep4": {
+      "title": {
+        "en": "Blind 4"
+      }
+    },
     "onoff.ep5": {
       "title": {
         "en": "Switch 5"
@@ -74,12 +100,22 @@
         "en": "Blind 5"
       }
     },
+    "windowcoverings_state.ep5": {
+      "title": {
+        "en": "Blind 5"
+      }
+    },
     "onoff.ep6": {
       "title": {
         "en": "Switch 6"
       }
     },
     "dim.ep6": {
+      "title": {
+        "en": "Blind 6"
+      }
+    },
+    "windowcoverings_state.ep6": {
       "title": {
         "en": "Blind 6"
       }
@@ -150,6 +186,19 @@
       "value": "",
       "hint": {
         "en": "Custom name for the switch/dimmer on endpoint 6."
+      }
+    },
+    {
+      "id": "blind_travel_seconds",
+      "type": "number",
+      "label": {
+        "en": "Blind travel time (seconds)"
+      },
+      "value": 30,
+      "min": 5,
+      "max": 180,
+      "hint": {
+        "en": "How long a blind takes to fully open or close. The control returns to idle after this time (blinds report no position on this hardware, so movement is tracked optimistically)."
       }
     }
   ],

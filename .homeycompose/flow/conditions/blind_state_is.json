@@ -1,0 +1,56 @@
+{
+  "id": "blind_state_is",
+  "title": {
+    "en": "Blind state is..."
+  },
+  "titleFormatted": {
+    "en": "[[endpoint]] is [[state]]"
+  },
+  "hint": {
+    "en": "Check whether a blind endpoint is opening, idle, or closing."
+  },
+  "args": [
+    {
+      "name": "device",
+      "type": "device",
+      "filter": "driver_id=wallwand"
+    },
+    {
+      "name": "endpoint",
+      "type": "autocomplete",
+      "title": {
+        "en": "Endpoint (Blind)"
+      },
+      "placeholder": {
+        "en": "Select blind endpoint"
+      }
+    },
+    {
+      "name": "state",
+      "type": "dropdown",
+      "title": {
+        "en": "State"
+      },
+      "values": [
+        {
+          "id": "up",
+          "label": {
+            "en": "opening"
+          }
+        },
+        {
+          "id": "idle",
+          "label": {
+            "en": "idle"
+          }
+        },
+        {
+          "id": "down",
+          "label": {
+            "en": "closing"
+          }
+        }
+      ]
+    }
+  ]
+}

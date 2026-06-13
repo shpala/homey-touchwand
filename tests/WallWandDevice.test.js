@@ -6,6 +6,7 @@ jest.mock('homey-zwavedriver', () => ({
       this._capabilities = new Set();
       this._capabilityValues = {};
       this._capabilityOptions = {};
+      this._capabilityListeners = {};
       this._store = {};
       this._settings = {};
       this._triggerCards = new Map();
@@ -86,7 +87,16 @@ jest.mock('homey-zwavedriver', () => ({
     }
 
     registerCapability() {}
-    async triggerCapabilityListener() {}
+
+    registerCapabilityListener(cap, fn) {
+      this._capabilityListeners[cap] = fn;
+    }
+
+    async triggerCapabilityListener(cap, value, opts) {
+      const fn = this._capabilityListeners[cap];
+      if (fn) return fn(value, opts);
+      return undefined;
+    }
   },
 }));
 
@@ -121,9 +131,17 @@ function makeMultilevelEndpoint(reportValue) {
       COMMAND_CLASS_BASIC: makeCommandClassMock(),
       COMMAND_CLASS_SWITCH_MULTILEVEL: makeCommandClassMock({
         SWITCH_MULTILEVEL_GET: jest.fn().mockResolvedValue({ 'Current Value': reportValue }),
+        SWITCH_MULTILEVEL_SET: jest.fn().mockResolvedValue(undefined),
+        SWITCH_MULTILEVEL_STOP_LEVEL_CHANGE: jest.fn().mockResolvedValue(undefined),
       }),
     },
   };
+}
+
+// Returns the SWITCH_MULTILEVEL command class for an endpoint so the blind
+// SET / STOP mocks can be inspected.
+function multilevelCc(node, endpointNum) {
+  return node.MultiChannelNodes[endpointNum].CommandClass.COMMAND_CLASS_SWITCH_MULTILEVEL;
 }
 
 function makeNode(endpoints = {}) {
@@ -488,24 +506,24 @@ describe('WallWandDevice', () => {
       expect(turnedOff.trigger).toHaveBeenCalled();
     });
 
-    test('BASIC_SET with a level on a dimmer endpoint sets onoff and dim', async () => {
-      const listener = getBasicListener(1);
-
-      await listener({ name: 'BASIC_SET' }, { Value: 75 });
-
-      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
-      expect(device.getCapabilityValue('dim.ep1')).toBeCloseTo(75 / 99);
-    });
-
-    test('BASIC_SET 255 on a dimmer endpoint turns it on and re-reads the level', async () => {
-      node.MultiChannelNodes[1].CommandClass.COMMAND_CLASS_SWITCH_MULTILEVEL.SWITCH_MULTILEVEL_GET =
-        jest.fn().mockResolvedValue({ 'Current Value': 80 });
+    test('BASIC_SET 255 on a blind endpoint optimistically maps to up with no read-back', async () => {
+      // Blinds emit no frames on physical use; this best-effort path is dead on
+      // real hardware but must still map without polling the panel
       const listener = getBasicListener(1);
 
       await listener({ name: 'BASIC_SET' }, { Value: 255 });
 
-      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
-      expect(device.getCapabilityValue('dim.ep1')).toBeCloseTo(80 / 99);
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('up');
+      const cc = multilevelCc(node, 1);
+      expect(cc.SWITCH_MULTILEVEL_GET).not.toHaveBeenCalled();
+    });
+
+    test('BASIC_SET 0 on a blind endpoint optimistically maps to down', async () => {
+      const listener = getBasicListener(1);
+
+      await listener({ name: 'BASIC_SET' }, { Value: 0 });
+
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('down');
     });
 
     test('non-SET basic reports and invalid values are ignored', async () => {
@@ -578,10 +596,10 @@ describe('WallWandDevice', () => {
       await jest.advanceTimersByTimeAsync(50);
 
       expect(syncSpy).toHaveBeenCalledTimes(1);
-      expect(syncSpy).toHaveBeenCalledWith(DEVICE_TYPES.DIMMER);
+      expect(syncSpy).toHaveBeenCalledWith(DEVICE_TYPES.BLIND);
     });
 
-    test('debounced sync polls the endpoint and updates capability values', async () => {
+    test('debounced switch sync polls the endpoint and updates capability values', async () => {
       node.MultiChannelNodes[1].CommandClass.COMMAND_CLASS_SWITCH_BINARY.SWITCH_BINARY_GET = jest
         .fn()
         .mockResolvedValue({ 'Current Value': 'off/disable' });
@@ -593,14 +611,23 @@ describe('WallWandDevice', () => {
       await jest.advanceTimersByTimeAsync(WallWandDevice.SYNC_DEBOUNCE_MS);
 
       expect(device.getCapabilityValue('onoff.ep1')).toBe(false);
-      expect(device.getCapabilityValue('dim.ep2')).toBe(50 / 99);
+    });
+
+    test('a root multilevel report never GETs the blind endpoint', async () => {
+      const blindCc = multilevelCc(node, 2);
+      const listener = getRootListener('COMMAND_CLASS_SWITCH_MULTILEVEL');
+
+      await listener();
+      await jest.advanceTimersByTimeAsync(WallWandDevice.SYNC_DEBOUNCE_MS);
+
+      expect(blindCc.SWITCH_MULTILEVEL_GET).not.toHaveBeenCalled();
     });
   });
 
   describe('endpoint type detection', () => {
-    test('detects dimmer endpoints', () => {
+    test('detects blind (multilevel) endpoints', () => {
       const ep = makeMultilevelEndpoint(50);
-      expect(device._detectEndpointType(ep, ep.CommandClass)).toBe(DEVICE_TYPES.DIMMER);
+      expect(device._detectEndpointType(ep, ep.CommandClass)).toBe(DEVICE_TYPES.BLIND);
     });
 
     test('detects switch endpoints', () => {
@@ -643,12 +670,12 @@ describe('WallWandDevice', () => {
       await expect(device._verifyEndpointLive(1)).resolves.toBe(DEVICE_TYPES.SWITCH);
     });
 
-    test('maps a live multilevel report to the dimmer type', async () => {
+    test('maps a live multilevel report to the blind type', async () => {
       const node = makeNode({});
       addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 17, [0x26, 0x85]) });
       device.node = node;
 
-      await expect(device._verifyEndpointLive(1)).resolves.toBe(DEVICE_TYPES.DIMMER);
+      await expect(device._verifyEndpointLive(1)).resolves.toBe(DEVICE_TYPES.BLIND);
     });
 
     test('returns null for a wall controller endpoint', async () => {
@@ -729,7 +756,7 @@ describe('WallWandDevice', () => {
       const node = makeNode({ 2: makeStaleMultilevelEndpoint() });
       addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25, 0x85]) });
       device.node = node;
-      device._store.endpointTypes = { 2: DEVICE_TYPES.DIMMER };
+      device._store.endpointTypes = { 2: 'dimmer' };
       await device.addCapability('onoff.ep2');
       await device.addCapability('dim.ep2');
       const regSpy = jest.spyOn(device, 'registerCapability');
@@ -753,7 +780,7 @@ describe('WallWandDevice', () => {
       const node = makeNode({ 2: makeStaleMultilevelEndpoint() });
       addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25, 0x85]) });
       device.node = node;
-      device._store.endpointTypes = { 2: DEVICE_TYPES.DIMMER };
+      device._store.endpointTypes = { 2: 'dimmer' };
 
       await device.onNodeInit({ node });
 
@@ -776,7 +803,7 @@ describe('WallWandDevice', () => {
       const node = makeNode({ 2: makeStaleMultilevelEndpoint() });
       addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25, 0x85]) });
       device.node = node;
-      device._store.endpointTypes = { 2: DEVICE_TYPES.DIMMER };
+      device._store.endpointTypes = { 2: 'dimmer' };
       const regSpy = jest.spyOn(device, 'registerCapability').mockImplementation(() => {
         throw new Error('unknown_capability');
       });
@@ -903,7 +930,7 @@ describe('WallWandDevice', () => {
       addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25]) });
       device.node = node;
       // Poisoned store from the buggy generation: verified, but mistyped
-      device._store.endpointTypes = { 2: DEVICE_TYPES.DIMMER };
+      device._store.endpointTypes = { 2: 'dimmer' };
       device._store.endpointTypesVerified = { 2: true };
       device._store.endpointVerifyGeneration = WallWandDevice.VERIFY_GENERATION - 1;
 
@@ -914,24 +941,6 @@ describe('WallWandDevice', () => {
       expect(device._store.endpointTypesVerified[2]).toBe(true);
       expect(device.hasCapability('dim.ep2')).toBe(false);
       expect(device.hasCapability('onoff.ep2')).toBe(true);
-    });
-
-    test('a verify generation bump also reruns the blind state reset', async () => {
-      const node = makeNode({ 1: makeMultilevelEndpoint(0) });
-      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 17, [0x26]) });
-      device.node = node;
-      device._store.endpointTypes = { 1: DEVICE_TYPES.DIMMER };
-      device._store.blindStateResetDone = true;
-      // Fabricated state leaked in under the old generation
-      device._capabilityValues['onoff.ep1'] = false;
-      device._capabilityValues['dim.ep1'] = 0;
-      device._store.endpointVerifyGeneration = WallWandDevice.VERIFY_GENERATION - 1;
-
-      await device.onNodeInit({ node });
-
-      expect(device.getCapabilityValue('onoff.ep1')).toBeNull();
-      expect(device.getCapabilityValue('dim.ep1')).toBeNull();
-      expect(device._store.blindStateResetDone).toBe(true);
     });
 
     test('the current verify generation keeps stored verifications', async () => {
@@ -950,58 +959,29 @@ describe('WallWandDevice', () => {
     });
   });
 
-  describe('blind report parsers', () => {
-    // The library writes parsed reports straight into capabilities; for blinds the
-    // panel's 0-reports carry no position, so the parsers must reject them
-    test('ignore the meaningless 0 and 255 reports', () => {
-      expect(device._blindOnoffReportParser({ 'Current Value': 0 })).toBeNull();
-      expect(device._blindOnoffReportParser({ 'Current Value': 'off/disable' })).toBeNull();
-      expect(device._blindDimReportParser({ 'Current Value': 0 })).toBeNull();
-      expect(device._blindDimReportParser({ 'Current Value': 'off/disable' })).toBeNull();
-      expect(device._blindDimReportParser({ 'Current Value': 255 })).toBeNull();
-      expect(device._blindDimReportParser({ 'Current Value': 'on/enable' })).toBeNull();
-      expect(device._blindDimReportParser({})).toBeNull();
-    });
-
-    test('pass real 1-99 levels through', () => {
-      expect(device._blindOnoffReportParser({ 'Current Value': 50 })).toBe(true);
-      expect(device._blindOnoffReportParser({ 'Current Value': 255 })).toBe(true);
-      expect(device._blindOnoffReportParser({ 'Current Value': 'on/enable' })).toBe(true);
-      expect(device._blindDimReportParser({ 'Current Value': 50 })).toBeCloseTo(50 / 99);
-      expect(device._blindDimReportParser({ 'Current Value': 99 })).toBe(1);
-    });
-
-    test('dimmer registration overrides the library report parser', async () => {
+  describe('blind capability registration', () => {
+    test('adds windowcoverings_state, removes onoff/dim and registers a manual listener', async () => {
+      // Paired devices arrive carrying the stale onoff/dim caps; the blind
+      // branch must strip them and add the cover capability instead
+      await device.addCapability('onoff.ep1');
+      await device.addCapability('dim.ep1');
       const regSpy = jest.spyOn(device, 'registerCapability');
+      const listenerSpy = jest.spyOn(device, 'registerCapabilityListener');
 
-      await device._registerEndpointCapabilities(1, DEVICE_TYPES.DIMMER, {
+      await device._registerEndpointCapabilities(1, DEVICE_TYPES.BLIND, {
         COMMAND_CLASS_SWITCH_MULTILEVEL: makeCommandClassMock(),
       });
 
-      for (const cap of ['onoff.ep1', 'dim.ep1']) {
-        const call = regSpy.mock.calls.find(c => c[0] === cap);
-        expect(call).toBeDefined();
-        expect(typeof call[2].reportParser).toBe('function');
-        // Without the explicit override flag the library's version-specific
-        // parsers (reportParserV4) still win and write the 0-reports
-        expect(call[2].reportParserOverride).toBe(true);
-      }
+      expect(device.hasCapability('windowcoverings_state.ep1')).toBe(true);
+      expect(device.hasCapability('onoff.ep1')).toBe(false);
+      expect(device.hasCapability('dim.ep1')).toBe(false);
+      // No system map exists for windowcoverings_state over SWITCH_MULTILEVEL,
+      // so the blind must never go through registerCapability
+      expect(regSpy).not.toHaveBeenCalled();
+      expect(listenerSpy).toHaveBeenCalledWith('windowcoverings_state.ep1', expect.any(Function));
     });
 
-    test('the BASIC fallback registration also overrides the report parser', async () => {
-      const regSpy = jest.spyOn(device, 'registerCapability');
-
-      await device._registerEndpointCapabilities(1, DEVICE_TYPES.DIMMER, {
-        COMMAND_CLASS_BASIC: makeCommandClassMock(),
-      });
-
-      const call = regSpy.mock.calls.find(c => c[0] === 'dim.ep1' && c[1] === 'BASIC');
-      expect(call).toBeDefined();
-      expect(typeof call[2].reportParser).toBe('function');
-      expect(call[2].reportParserOverride).toBe(true);
-    });
-
-    test('switch registration keeps the library report parser', async () => {
+    test('switch registration keeps the library report parser and uses registerCapability', async () => {
       const regSpy = jest.spyOn(device, 'registerCapability');
 
       await device._registerEndpointCapabilities(3, DEVICE_TYPES.SWITCH, {
@@ -1015,25 +995,6 @@ describe('WallWandDevice', () => {
   });
 
   describe('capability registration fallbacks', () => {
-    test('registers dimmer capabilities against BASIC when the cache lacks SWITCH_MULTILEVEL', async () => {
-      const regSpy = jest.spyOn(device, 'registerCapability');
-
-      await device._registerEndpointCapabilities(1, DEVICE_TYPES.DIMMER, {
-        COMMAND_CLASS_BASIC: makeCommandClassMock(),
-      });
-
-      expect(regSpy).toHaveBeenCalledWith(
-        'onoff.ep1',
-        'BASIC',
-        expect.objectContaining({ getOpts: { getOnStart: false } })
-      );
-      expect(regSpy).toHaveBeenCalledWith(
-        'dim.ep1',
-        'BASIC',
-        expect.objectContaining({ getOpts: { getOnStart: false } })
-      );
-    });
-
     test('skips registration without crashing when the cache lacks the typed CC and BASIC', async () => {
       const regSpy = jest.spyOn(device, 'registerCapability');
 
@@ -1067,48 +1028,257 @@ describe('WallWandDevice', () => {
 
   describe('blind state sync', () => {
     beforeEach(async () => {
-      device._endpointTypes = { 1: DEVICE_TYPES.DIMMER };
-      await device.addCapability('onoff.ep1');
-      await device.addCapability('dim.ep1');
+      device._endpointTypes = { 1: DEVICE_TYPES.BLIND };
+      await device.addCapability('windowcoverings_state.ep1');
     });
 
-    test('a 0 report counts as success but writes nothing', async () => {
-      // These blinds report 0 regardless of position, so 0 only proves liveness
-      await device.setCapabilityValue('onoff.ep1', true);
-      await device.setCapabilityValue('dim.ep1', 0.7);
-      device._syncFailureCounts[1] = 2;
+    test('never sends a multilevel GET', async () => {
+      const endpoint = makeMultilevelEndpoint(50);
 
-      await device._syncOneEndpointState(1, makeMultilevelEndpoint('off/disable'));
+      await device._syncOneEndpointState(1, endpoint);
 
-      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
-      expect(device.getCapabilityValue('dim.ep1')).toBe(0.7);
+      const cc = endpoint.CommandClass.COMMAND_CLASS_SWITCH_MULTILEVEL;
+      expect(cc.SWITCH_MULTILEVEL_GET).not.toHaveBeenCalled();
+    });
+
+    test('sets idle when the capability value is null', async () => {
+      await device.setCapabilityValue('windowcoverings_state.ep1', null);
+
+      await device._syncOneEndpointState(1, makeMultilevelEndpoint(50));
+
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('idle');
       expect(device._syncFailureCounts[1]).toBe(0);
     });
 
-    test('a numeric 0 report also writes nothing', async () => {
-      await device.setCapabilityValue('onoff.ep1', true);
-      await device.setCapabilityValue('dim.ep1', 0.7);
+    test('leaves a known state untouched', async () => {
+      await device.setCapabilityValue('windowcoverings_state.ep1', 'up');
 
-      await device._syncOneEndpointState(1, makeMultilevelEndpoint(0));
-
-      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
-      expect(device.getCapabilityValue('dim.ep1')).toBe(0.7);
-    });
-
-    test('a 1-99 report writes onoff and dim', async () => {
       await device._syncOneEndpointState(1, makeMultilevelEndpoint(50));
 
-      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
-      expect(device.getCapabilityValue('dim.ep1')).toBeCloseTo(50 / 99);
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('up');
+    });
+  });
+
+  describe('blind command + travel timer', () => {
+    let node;
+
+    beforeEach(async () => {
+      node = makeNode({ 1: makeMultilevelEndpoint(0) });
+      device.node = node;
+      device._endpointTypes = { 1: DEVICE_TYPES.BLIND };
+      await device.addCapability('windowcoverings_state.ep1');
+      device._registerBlindListener(1);
+      device._initialSyncDone = true;
     });
 
-    test('a 255 report writes onoff only', async () => {
-      await device.setCapabilityValue('dim.ep1', 0.3);
+    test('up enqueues a SET 255 exactly once and sets the value optimistically', async () => {
+      const addSpy = jest.spyOn(device._commandQueue, 'add');
 
-      await device._syncOneEndpointState(1, makeMultilevelEndpoint('on/enable'));
+      await device.triggerCapabilityListener('windowcoverings_state.ep1', 'up');
 
-      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
-      expect(device.getCapabilityValue('dim.ep1')).toBe(0.3);
+      const cc = multilevelCc(node, 1);
+      expect(cc.SWITCH_MULTILEVEL_SET).toHaveBeenCalledTimes(1);
+      // v4 SET requires a numeric Value AND Duration (omitting Duration throws
+      // invalid_type_expected_number on hardware); 0xFF = device's own travel time
+      expect(cc.SWITCH_MULTILEVEL_SET).toHaveBeenCalledWith({ Value: 255, Duration: 255 });
+      expect(addSpy).toHaveBeenCalledTimes(1);
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('up');
+    });
+
+    test('down enqueues a SET 0', async () => {
+      await device.triggerCapabilityListener('windowcoverings_state.ep1', 'down');
+
+      const cc = multilevelCc(node, 1);
+      expect(cc.SWITCH_MULTILEVEL_SET).toHaveBeenCalledWith({ Value: 0, Duration: 255 });
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('down');
+    });
+
+    test('idle enqueues a STOP_LEVEL_CHANGE', async () => {
+      await device.triggerCapabilityListener('windowcoverings_state.ep1', 'idle');
+
+      const cc = multilevelCc(node, 1);
+      expect(cc.SWITCH_MULTILEVEL_STOP_LEVEL_CHANGE).toHaveBeenCalledWith({});
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('idle');
+    });
+
+    test('a transient drive error does not reject the listener', async () => {
+      multilevelCc(node, 1).SWITCH_MULTILEVEL_SET = jest
+        .fn()
+        .mockRejectedValue(new Error('timeout after 10000ms'));
+
+      await expect(
+        device.triggerCapabilityListener('windowcoverings_state.ep1', 'up')
+      ).resolves.toBeUndefined();
+      // Optimistic state stands even though the frame failed
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('up');
+    });
+
+    test('sets the optimistic value and fires the trigger before the Z-Wave frame settles', async () => {
+      // The drive frame stays pending so we can observe the UI/trigger side
+      // effects happening optimistically, independent of frame completion.
+      let releaseDrive;
+      multilevelCc(node, 1).SWITCH_MULTILEVEL_SET = jest.fn().mockReturnValue(
+        new Promise(resolve => {
+          releaseDrive = resolve;
+        })
+      );
+      const blindChanged = device.homey.flow.getDeviceTriggerCard('blind_state_changed');
+      blindChanged.trigger.mockClear();
+
+      // The listener must resolve without waiting for the (still pending) frame
+      await device.triggerCapabilityListener('windowcoverings_state.ep1', 'up');
+
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('up');
+      expect(blindChanged.trigger).toHaveBeenCalled();
+
+      // Let the queued frame settle to avoid an unhandled rejection on teardown
+      releaseDrive();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(multilevelCc(node, 1).SWITCH_MULTILEVEL_SET).toHaveBeenCalledTimes(1);
+    });
+
+    test('still applies the optimistic state when the queue is cleared mid-flight', async () => {
+      // onDeleted clears the queue, rejecting pending adds with 'Queue cleared';
+      // the optimistic state must already be applied so the UI is never stuck.
+      let releaseDrive;
+      multilevelCc(node, 1).SWITCH_MULTILEVEL_SET = jest.fn().mockReturnValue(
+        new Promise(resolve => {
+          releaseDrive = resolve;
+        })
+      );
+
+      await device.triggerCapabilityListener('windowcoverings_state.ep1', 'down');
+
+      expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('down');
+
+      // Clearing the queue must not throw an unhandled rejection back at us
+      device._commandQueue.clear();
+      releaseDrive();
+      await new Promise(resolve => setImmediate(resolve));
+    });
+
+    describe('travel timer', () => {
+      beforeEach(() => jest.useFakeTimers());
+      afterEach(() => jest.useRealTimers());
+
+      test('reverts to idle and fires blind_state_changed after the travel time', async () => {
+        await device.triggerCapabilityListener('windowcoverings_state.ep1', 'up');
+        const blindChanged = device.homey.flow.getDeviceTriggerCard('blind_state_changed');
+        blindChanged.trigger.mockClear();
+
+        await jest.advanceTimersByTimeAsync(WallWandDevice.BLIND_TRAVEL_SECONDS * 1000);
+
+        expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('idle');
+        expect(blindChanged.trigger).toHaveBeenCalled();
+      });
+
+      test('idle clears the travel timer so it cannot revert later', async () => {
+        await device.triggerCapabilityListener('windowcoverings_state.ep1', 'up');
+        await device.triggerCapabilityListener('windowcoverings_state.ep1', 'idle');
+        await device.setCapabilityValue('windowcoverings_state.ep1', 'down');
+
+        await jest.advanceTimersByTimeAsync(WallWandDevice.BLIND_TRAVEL_SECONDS * 1000);
+
+        // The earlier up-timer must not have fired and clobbered the value
+        expect(device.getCapabilityValue('windowcoverings_state.ep1')).toBe('down');
+      });
+    });
+  });
+
+  describe('blind_state_changed trigger suppression', () => {
+    let node;
+
+    beforeEach(async () => {
+      node = makeNode({ 1: makeMultilevelEndpoint(0) });
+      device.node = node;
+      device._endpointTypes = { 1: DEVICE_TYPES.BLIND };
+      await device.addCapability('windowcoverings_state.ep1');
+      device._registerBlindListener(1);
+    });
+
+    test('is suppressed before the initial sync completes', async () => {
+      device._initialSyncDone = false;
+
+      await device.triggerCapabilityListener('windowcoverings_state.ep1', 'up');
+
+      const blindChanged = device.homey.flow.getDeviceTriggerCard('blind_state_changed');
+      expect(blindChanged.trigger).not.toHaveBeenCalled();
+    });
+
+    test('fires after the initial sync completes', async () => {
+      device._initialSyncDone = true;
+
+      await device.triggerCapabilityListener('windowcoverings_state.ep1', 'up');
+
+      const blindChanged = device.homey.flow.getDeviceTriggerCard('blind_state_changed');
+      expect(blindChanged.trigger).toHaveBeenCalled();
+    });
+  });
+
+  describe('endpoint autocomplete type filter', () => {
+    beforeEach(() => {
+      device._endpointTypes = {
+        1: DEVICE_TYPES.BLIND,
+        2: DEVICE_TYPES.SWITCH,
+      };
+    });
+
+    test('returns only blinds for the blind filter', async () => {
+      const list = await device._getEndpointAutocompleteList('', DEVICE_TYPES.BLIND);
+      expect(list.map(i => i.id)).toEqual([1]);
+    });
+
+    test('returns only switches for the switch filter', async () => {
+      const list = await device._getEndpointAutocompleteList('', DEVICE_TYPES.SWITCH);
+      expect(list.map(i => i.id)).toEqual([2]);
+    });
+
+    test('returns everything with no filter', async () => {
+      const list = await device._getEndpointAutocompleteList('');
+      expect(list.map(i => i.id).sort()).toEqual([1, 2]);
+    });
+  });
+
+  describe('blind_state_is condition', () => {
+    beforeEach(async () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.BLIND };
+      await device.addCapability('windowcoverings_state.ep1');
+    });
+
+    test('matches the current cover state', async () => {
+      await device.setCapabilityValue('windowcoverings_state.ep1', 'up');
+
+      await expect(device._handleBlindStateIs({ endpoint: { id: 1 }, state: 'up' })).resolves.toBe(
+        true
+      );
+      await expect(
+        device._handleBlindStateIs({ endpoint: { id: 1 }, state: 'down' })
+      ).resolves.toBe(false);
+    });
+  });
+
+  describe('blind health check', () => {
+    test('a blind endpoint with its cover capability is healthy and does not rediscover', async () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.BLIND };
+      device._endpointTypesVerified = { 1: true };
+      await device.addCapability('windowcoverings_state.ep1');
+      device.node = makeNode({ 1: makeMultilevelEndpoint(0) });
+      const discoverSpy = jest.spyOn(device, '_discoverAllEndpoints').mockResolvedValue();
+
+      await device._checkDeviceHealth();
+
+      expect(discoverSpy).not.toHaveBeenCalled();
+    });
+
+    test('a blind endpoint missing its cover capability triggers rediscovery', async () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.BLIND };
+      await device.addCapability('onoff.ep1');
+      device.node = makeNode({ 1: makeMultilevelEndpoint(0) });
+      const discoverSpy = jest.spyOn(device, '_discoverAllEndpoints').mockResolvedValue();
+
+      await device._checkDeviceHealth();
+
+      expect(discoverSpy).toHaveBeenCalled();
     });
   });
 
@@ -1159,41 +1329,69 @@ describe('WallWandDevice', () => {
     });
   });
 
-  describe('one-time blind state reset', () => {
-    test('nulls dimmer capabilities exactly once and fires no triggers', async () => {
-      const node = makeNode({ 1: makeMultilevelEndpoint('off/disable') });
-      device.node = node;
-      // Simulate fabricated state left behind by older versions
-      device._store.endpointTypes = { 1: DEVICE_TYPES.DIMMER };
-      await device.addCapability('onoff.ep1');
-      await device.addCapability('dim.ep1');
-      await device.setCapabilityValue('onoff.ep1', false);
-      await device.setCapabilityValue('dim.ep1', 0);
+  describe('blind labels', () => {
+    test('blind endpoints default to a Blind label', () => {
+      device._endpointTypes = { 1: DEVICE_TYPES.BLIND };
 
-      await device.onNodeInit({ node });
-
-      expect(device.getCapabilityValue('onoff.ep1')).toBeNull();
-      expect(device.getCapabilityValue('dim.ep1')).toBeNull();
-      expect(device._store.blindStateResetDone).toBe(true);
-      for (const card of device._triggerCards.values()) {
-        expect(card.trigger).not.toHaveBeenCalled();
-      }
-
-      // A later init must not clobber state again
-      await device.setCapabilityValue('onoff.ep1', true);
-      await device.setCapabilityValue('dim.ep1', 0.5);
-      await device.onNodeInit({ node });
-
-      expect(device.getCapabilityValue('onoff.ep1')).toBe(true);
-      expect(device.getCapabilityValue('dim.ep1')).toBe(0.5);
+      expect(device._getEndpointLabel(1)).toBe('Blind 1');
     });
   });
 
-  describe('blind labels', () => {
-    test('dimmer endpoints default to a Blind label', () => {
-      device._endpointTypes = { 1: DEVICE_TYPES.DIMMER };
+  describe('store dimmer -> blind migration', () => {
+    test('rewrites stored dimmer types to blind, preserving the verified flag', async () => {
+      const node = makeNode({ 1: makeMultilevelEndpoint(0) });
+      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 17, [0x26]) });
+      device.node = node;
+      // Already-paired device from the dimmer era: verified multilevel endpoint
+      device._store.endpointTypes = { 1: 'dimmer' };
+      device._store.endpointTypesVerified = { 1: true };
+      device._store.endpointVerifyGeneration = WallWandDevice.VERIFY_GENERATION;
+      await device.addCapability('onoff.ep1');
+      await device.addCapability('dim.ep1');
+      const probe = node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL.MULTI_CHANNEL_CAPABILITY_GET;
 
-      expect(device._getEndpointLabel(1)).toBe('Blind 1');
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[1]).toBe(DEVICE_TYPES.BLIND);
+      expect(device._store.endpointTypes[1]).toBe(DEVICE_TYPES.BLIND);
+      // The verified flag is kept, so the verified short-circuit avoids a re-probe
+      expect(device._endpointTypesVerified[1]).toBe(true);
+      expect(probe).not.toHaveBeenCalled();
+      // The blind ends up with the cover capability and no stale onoff/dim
+      expect(device.hasCapability('windowcoverings_state.ep1')).toBe(true);
+      expect(device.hasCapability('onoff.ep1')).toBe(false);
+      expect(device.hasCapability('dim.ep1')).toBe(false);
+    });
+
+    test('is idempotent across repeated inits', async () => {
+      const node = makeNode({ 1: makeMultilevelEndpoint(0) });
+      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 17, [0x26]) });
+      device.node = node;
+      device._store.endpointTypes = { 1: 'dimmer' };
+      device._store.endpointTypesVerified = { 1: true };
+      device._store.endpointVerifyGeneration = WallWandDevice.VERIFY_GENERATION;
+
+      await device.onNodeInit({ node });
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[1]).toBe(DEVICE_TYPES.BLIND);
+      expect(device.hasCapability('windowcoverings_state.ep1')).toBe(true);
+    });
+
+    test('the migration completes before the initial sync gate opens', async () => {
+      // A migrated, optimistically-idle blind must not fire blind_state_changed
+      // during the upgrade init
+      const node = makeNode({ 1: makeMultilevelEndpoint(0) });
+      addMultiChannelCommandClass(node, { 1: makeLiveCapabilityReport(1, 17, [0x26]) });
+      device.node = node;
+      device._store.endpointTypes = { 1: 'dimmer' };
+      device._store.endpointTypesVerified = { 1: true };
+      device._store.endpointVerifyGeneration = WallWandDevice.VERIFY_GENERATION;
+
+      await device.onNodeInit({ node });
+
+      const blindChanged = device.homey.flow.getDeviceTriggerCard('blind_state_changed');
+      expect(blindChanged.trigger).not.toHaveBeenCalled();
     });
   });
 });

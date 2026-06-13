@@ -1,0 +1,29 @@
+{
+  "id": "open_blind",
+  "title": {
+    "en": "Open blind"
+  },
+  "titleFormatted": {
+    "en": "Open [[endpoint]]"
+  },
+  "hint": {
+    "en": "Open (raise) a WallWand blind endpoint."
+  },
+  "args": [
+    {
+      "name": "device",
+      "type": "device",
+      "filter": "driver_id=wallwand"
+    },
+    {
+      "name": "endpoint",
+      "type": "autocomplete",
+      "title": {
+        "en": "Endpoint (Blind)"
+      },
+      "placeholder": {
+        "en": "Select blind endpoint"
+      }
+    }
+  ]
+}

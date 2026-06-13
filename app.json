@@ -10,7 +10,7 @@
   "category": [
     "tools"
   ],
-  "version": "0.1.6",
+  "version": "0.2.0",
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "platforms": [
@@ -27,7 +27,64 @@
   "flow": {
     "conditions": [
       {
+        "id": "blind_state_is",
+        "title": {
+          "en": "Blind state is..."
+        },
+        "titleFormatted": {
+          "en": "[[endpoint]] is [[state]]"
+        },
+        "hint": {
+          "en": "Check whether a blind endpoint is opening, idle, or closing."
+        },
+        "args": [
+          {
+            "name": "device",
+            "type": "device",
+            "filter": "driver_id=wallwand"
+          },
+          {
+            "name": "endpoint",
+            "type": "autocomplete",
+            "title": {
+              "en": "Endpoint (Blind)"
+            },
+            "placeholder": {
+              "en": "Select blind endpoint"
+            }
+          },
+          {
+            "name": "state",
+            "type": "dropdown",
+            "title": {
+              "en": "State"
+            },
+            "values": [
+              {
+                "id": "up",
+                "label": {
+                  "en": "opening"
+                }
+              },
+              {
+                "id": "idle",
+                "label": {
+                  "en": "idle"
+                }
+              },
+              {
+                "id": "down",
+                "label": {
+                  "en": "closing"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
         "id": "endpoint_dim_compare",
+        "deprecated": true,
         "title": {
           "en": "Dimmer level is..."
         },
@@ -118,7 +175,66 @@
     ],
     "actions": [
       {
+        "id": "close_blind",
+        "title": {
+          "en": "Close blind"
+        },
+        "titleFormatted": {
+          "en": "Close [[endpoint]]"
+        },
+        "hint": {
+          "en": "Close (lower) a WallWand blind endpoint."
+        },
+        "args": [
+          {
+            "name": "device",
+            "type": "device",
+            "filter": "driver_id=wallwand"
+          },
+          {
+            "name": "endpoint",
+            "type": "autocomplete",
+            "title": {
+              "en": "Endpoint (Blind)"
+            },
+            "placeholder": {
+              "en": "Select blind endpoint"
+            }
+          }
+        ]
+      },
+      {
+        "id": "open_blind",
+        "title": {
+          "en": "Open blind"
+        },
+        "titleFormatted": {
+          "en": "Open [[endpoint]]"
+        },
+        "hint": {
+          "en": "Open (raise) a WallWand blind endpoint."
+        },
+        "args": [
+          {
+            "name": "device",
+            "type": "device",
+            "filter": "driver_id=wallwand"
+          },
+          {
+            "name": "endpoint",
+            "type": "autocomplete",
+            "title": {
+              "en": "Endpoint (Blind)"
+            },
+            "placeholder": {
+              "en": "Select blind endpoint"
+            }
+          }
+        ]
+      },
+      {
         "id": "set_endpoint_dim",
+        "deprecated": true,
         "title": {
           "en": "Set endpoint brightness"
         },
@@ -155,6 +271,35 @@
             "labelDecimals": 0,
             "title": {
               "en": "Brightness"
+            }
+          }
+        ]
+      },
+      {
+        "id": "stop_blind",
+        "title": {
+          "en": "Stop blind"
+        },
+        "titleFormatted": {
+          "en": "Stop [[endpoint]]"
+        },
+        "hint": {
+          "en": "Stop a moving WallWand blind endpoint."
+        },
+        "args": [
+          {
+            "name": "device",
+            "type": "device",
+            "filter": "driver_id=wallwand"
+          },
+          {
+            "name": "endpoint",
+            "type": "autocomplete",
+            "title": {
+              "en": "Endpoint (Blind)"
+            },
+            "placeholder": {
+              "en": "Select blind endpoint"
             }
           }
         ]
@@ -344,6 +489,7 @@
       },
       {
         "id": "endpoint_dim_changed",
+        "deprecated": true,
         "title": {
           "en": "Endpoint dimmer changed"
         },
@@ -451,6 +597,61 @@
             "example": true
           }
         ]
+      },
+      {
+        "id": "blind_state_changed",
+        "title": {
+          "en": "Blind moved"
+        },
+        "titleFormatted": {
+          "en": "[[endpoint]] moved"
+        },
+        "hint": {
+          "en": "Triggered when a blind endpoint starts opening, closing, or stops."
+        },
+        "args": [
+          {
+            "type": "device",
+            "name": "device",
+            "filter": "driver_id=wallwand"
+          },
+          {
+            "type": "autocomplete",
+            "name": "endpoint",
+            "title": {
+              "en": "Endpoint (Blind)"
+            },
+            "placeholder": {
+              "en": "Select blind endpoint"
+            }
+          }
+        ],
+        "tokens": [
+          {
+            "name": "endpoint_id",
+            "type": "number",
+            "title": {
+              "en": "Endpoint ID"
+            },
+            "example": 1
+          },
+          {
+            "name": "endpoint_label",
+            "type": "string",
+            "title": {
+              "en": "Endpoint Label"
+            },
+            "example": "Living Room Blind"
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "title": {
+              "en": "State"
+            },
+            "example": "up"
+          }
+        ]
       }
     ]
   },
@@ -469,16 +670,22 @@
       "capabilities": [
         "onoff.ep1",
         "dim.ep1",
+        "windowcoverings_state.ep1",
         "onoff.ep2",
         "dim.ep2",
+        "windowcoverings_state.ep2",
         "onoff.ep3",
         "dim.ep3",
+        "windowcoverings_state.ep3",
         "onoff.ep4",
         "dim.ep4",
+        "windowcoverings_state.ep4",
         "onoff.ep5",
         "dim.ep5",
+        "windowcoverings_state.ep5",
         "onoff.ep6",
-        "dim.ep6"
+        "dim.ep6",
+        "windowcoverings_state.ep6"
       ],
       "capabilitiesOptions": {
         "onoff.ep1": {
@@ -487,6 +694,11 @@
           }
         },
         "dim.ep1": {
+          "title": {
+            "en": "Blind 1"
+          }
+        },
+        "windowcoverings_state.ep1": {
           "title": {
             "en": "Blind 1"
           }
@@ -501,12 +713,22 @@
             "en": "Blind 2"
           }
         },
+        "windowcoverings_state.ep2": {
+          "title": {
+            "en": "Blind 2"
+          }
+        },
         "onoff.ep3": {
           "title": {
             "en": "Switch 3"
           }
         },
         "dim.ep3": {
+          "title": {
+            "en": "Blind 3"
+          }
+        },
+        "windowcoverings_state.ep3": {
           "title": {
             "en": "Blind 3"
           }
@@ -521,6 +743,11 @@
             "en": "Blind 4"
           }
         },
+        "windowcoverings_state.ep4": {
+          "title": {
+            "en": "Blind 4"
+          }
+        },
         "onoff.ep5": {
           "title": {
             "en": "Switch 5"
@@ -531,12 +758,22 @@
             "en": "Blind 5"
           }
         },
+        "windowcoverings_state.ep5": {
+          "title": {
+            "en": "Blind 5"
+          }
+        },
         "onoff.ep6": {
           "title": {
             "en": "Switch 6"
           }
         },
         "dim.ep6": {
+          "title": {
+            "en": "Blind 6"
+          }
+        },
+        "windowcoverings_state.ep6": {
           "title": {
             "en": "Blind 6"
           }
@@ -607,6 +844,19 @@
           "value": "",
           "hint": {
             "en": "Custom name for the switch/dimmer on endpoint 6."
+          }
+        },
+        {
+          "id": "blind_travel_seconds",
+          "type": "number",
+          "label": {
+            "en": "Blind travel time (seconds)"
+          },
+          "value": 30,
+          "min": 5,
+          "max": 180,
+          "hint": {
+            "en": "How long a blind takes to fully open or close. The control returns to idle after this time (blinds report no position on this hardware, so movement is tracked optimistically)."
           }
         }
       ],

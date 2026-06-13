@@ -1,5 +1,6 @@
 {
   "id": "endpoint_dim_compare",
+  "deprecated": true,
   "title": {
     "en": "Dimmer level is..."
   },

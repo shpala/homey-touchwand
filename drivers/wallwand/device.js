@@ -5,12 +5,13 @@ const CommandQueue = require('./lib/CommandQueue');
 
 module.exports = class WallWandDevice extends ZwaveDevice {
   static DEVICE_TYPES = {
-    DIMMER: 'dimmer',
+    BLIND: 'blind',
     SWITCH: 'switch',
   };
 
   // Z-Wave SWITCH_MULTILEVEL uses 0-99 range (0 = off, 1-99 = dim levels, 255 = restore last)
   static Z_WAVE_MAX_DIM_VALUE = 99;
+  static BLIND_TRAVEL_SECONDS = 30; // Optimistic up/down -> idle revert (overridable per device)
   static SYNC_DEBOUNCE_MS = 200;
   static HEALTH_CHECK_INTERVAL_MS = 300000; // 5 minutes
   static COMMAND_DELAY_MS = 250; // Delay between commands to prevent overwhelming device
@@ -20,12 +21,14 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   static VERIFY_GENERATION = 4; // Bump to force re-verification of every endpoint after a logic fix
   static VERIFY_PROBE_ATTEMPTS = 3; // Capability probes retried when a duplicate report desyncs the reply
   static VERIFY_RETRY_DELAY_MS = 400; // Lets the panel's duplicate-report bursts drain before retrying
+  static BLIND_SET_DURATION = 255; // 0xFF = use the panel's own configured shutter travel time (required numeric field on v4 SET)
 
   async onInit() {
     await super.onInit();
     this.log(`[WallWand Device onInit] ${this.getName()} created`);
 
     this._syncTimeouts = {};
+    this._blindTravelTimeouts = {};
     this._isDiscovering = false;
     // Loaded from the store in onNodeInit, but flow handlers may run before that
     this._endpointTypes = {};
@@ -72,6 +75,12 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       await this.setStoreValue('endpointVerifyGeneration', WallWandDevice.VERIFY_GENERATION);
     }
 
+    // One-time rename of the old 'dimmer' type to 'blind'. The endpoint is the
+    // same verified multilevel device; only the label changes, so the verified
+    // flags are kept and the verified short-circuit avoids a needless re-probe.
+    // Runs before discovery and the initial-sync gate so the upgrade is silent.
+    await this._migrateDimmerTypesToBlind();
+
     try {
       this._registerRootDeviceListeners(node);
       this._registerEndpointBasicListeners(node);
@@ -92,6 +101,22 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     } catch (error) {
       this.error('[onNodeInit] Initialization failed:', error.message || error);
       throw error;
+    }
+  }
+
+  // Rewrites every stored 'dimmer' endpoint type to 'blind' in place (idempotent).
+  // Keeps endpointTypesVerified untouched so a verified blind keeps its short-circuit.
+  async _migrateDimmerTypesToBlind() {
+    let changed = false;
+    for (const id of Object.keys(this._endpointTypes)) {
+      if (this._endpointTypes[id] === 'dimmer') {
+        this._endpointTypes[id] = WallWandDevice.DEVICE_TYPES.BLIND;
+        changed = true;
+      }
+    }
+    if (changed) {
+      await this.setStoreValue('endpointTypes', this._endpointTypes);
+      this.log('[MIGRATION] Renamed stored dimmer endpoint type(s) to blind');
     }
   }
 
@@ -123,6 +148,11 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     Object.values(this._syncTimeouts).forEach(timeout => this.homey.clearTimeout(timeout));
     this._syncTimeouts = {};
 
+    Object.values(this._blindTravelTimeouts || {}).forEach(timeout =>
+      this.homey.clearTimeout(timeout)
+    );
+    this._blindTravelTimeouts = {};
+
     // super.onDeleted() removes all command class listeners on the root node,
     // including the root report listeners registered in onNodeInit
     await super.onDeleted();
@@ -150,6 +180,124 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     );
   }
 
+  // Wires windowcoverings_state.ep{N} to a hand-rolled SET handler. There is no
+  // system map for this capability over SWITCH_MULTILEVEL, so the listener is
+  // the single point that enqueues the raw frame and owns the optimistic state.
+  _registerBlindListener(endpointNum) {
+    const cap = `windowcoverings_state.ep${endpointNum}`;
+    this.registerCapabilityListener(cap, value => this._onBlindStateSet(endpointNum, value));
+  }
+
+  // SET handler for a blind's windowcoverings_state. Flow actions reach it via
+  // triggerCapabilityListener, so this is the one enqueue point - do NOT also
+  // route blind actions through queueCapabilityCommand or the frame double-queues.
+  async _onBlindStateSet(endpointNum, value) {
+    if (!['up', 'down', 'idle'].includes(value)) {
+      throw new Error(`Unsupported blind state: ${value}`);
+    }
+
+    // Apply the optimistic state first so the widget updates and the travel
+    // timer starts immediately, independent of how long the frame takes (or
+    // whether the queue is cleared mid-flight during onDeleted).
+    await this._applyBlindStateLocally(endpointNum, value, { fireTrigger: true });
+
+    // Then enqueue the actual Z-Wave drive fire-and-forget. queue.add() only
+    // resolves once the frame settles (up to the 10s timeout); awaiting it here
+    // would block the optimistic update, and a 'Queue cleared' rejection on
+    // teardown would otherwise surface as an unhandled rejection.
+    if (this._commandQueue) {
+      this._commandQueue
+        .add(() => this._driveBlind(endpointNum, value), `Blind EP${endpointNum} = ${value}`)
+        .catch(err => {
+          this.log(`[BLIND] EP${endpointNum} drive ${value} queue error: ${err.message || err}`);
+        });
+    }
+  }
+
+  // Sends the actual Z-Wave frame for a blind command. Wrapped so a transient
+  // failure leaves the optimistic UI state in place rather than rejecting.
+  async _driveBlind(endpointNum, value) {
+    const cc =
+      this.node?.MultiChannelNodes?.[endpointNum]?.CommandClass?.COMMAND_CLASS_SWITCH_MULTILEVEL;
+    if (!cc) {
+      this.error(`[BLIND] EP${endpointNum} SWITCH_MULTILEVEL not available`);
+      return;
+    }
+
+    try {
+      if (value === 'up') {
+        // Value 255 drives the open/up relay (verified at the wire in the
+        // Gate-1 raw test). Duration is REQUIRED and numeric on this panel's
+        // SWITCH_MULTILEVEL v4 SET - omitting it throws invalid_type_expected_number
+        // (confirmed on hardware); 0xFF = the device's own configured travel time.
+        await cc.SWITCH_MULTILEVEL_SET({ Value: 255, Duration: WallWandDevice.BLIND_SET_DURATION });
+      } else if (value === 'down') {
+        // Value 0 drives the close/down relay.
+        await cc.SWITCH_MULTILEVEL_SET({ Value: 0, Duration: WallWandDevice.BLIND_SET_DURATION });
+      } else {
+        // Verified stop on fw 1.48: a bare STOP_LEVEL_CHANGE with no payload.
+        await cc.SWITCH_MULTILEVEL_STOP_LEVEL_CHANGE({});
+      }
+    } catch (error) {
+      const errorMsg = error.message || error.toString();
+      this.log(`[BLIND] EP${endpointNum} drive ${value} failed: ${errorMsg}`);
+    }
+  }
+
+  // State-only side of a blind change: persists the value (does NOT re-invoke the
+  // listener), manages the per-endpoint travel timer, and fires the trigger.
+  async _applyBlindStateLocally(endpointNum, state, { fireTrigger = false } = {}) {
+    const cap = `windowcoverings_state.ep${endpointNum}`;
+    if (!this.hasCapability(cap)) return;
+
+    await this.setCapabilityValue(cap, state).catch(err => {
+      this.error(`[BLIND] Failed to set ${cap} to ${state}: ${err.message || err.toString()}`);
+    });
+
+    if (state === 'up' || state === 'down') {
+      this._startBlindTravelTimer(endpointNum);
+    } else {
+      this._clearBlindTravelTimer(endpointNum);
+    }
+
+    // Reuse the initial-sync gate so an upgrade/boot doesn't fire spurious flows
+    if (fireTrigger && this._initialSyncDone) {
+      await this._triggerBlindStateChanged(endpointNum, state);
+    }
+  }
+
+  _getBlindTravelMs() {
+    const configured = Number(this.getSettings()?.blind_travel_seconds);
+    const seconds =
+      Number.isFinite(configured) && configured > 0
+        ? configured
+        : WallWandDevice.BLIND_TRAVEL_SECONDS;
+    return seconds * 1000;
+  }
+
+  _startBlindTravelTimer(endpointNum) {
+    this._clearBlindTravelTimer(endpointNum);
+    this._blindTravelTimeouts[endpointNum] = this.homey.setTimeout(() => {
+      delete this._blindTravelTimeouts[endpointNum];
+      // The motor has had time to finish travelling; revert to idle optimistically
+      this._applyBlindStateLocally(endpointNum, 'idle', { fireTrigger: true }).catch(err => {
+        this.error(`[BLIND] EP${endpointNum} travel revert failed: ${err.message || err}`);
+      });
+    }, this._getBlindTravelMs());
+  }
+
+  _clearBlindTravelTimer(endpointNum) {
+    if (this._blindTravelTimeouts[endpointNum]) {
+      this.homey.clearTimeout(this._blindTravelTimeouts[endpointNum]);
+      delete this._blindTravelTimeouts[endpointNum];
+    }
+  }
+
+  // Best-effort path for a physical/BASIC-originated blind change (no Z-Wave send).
+  async _setBlindState(endpointNum, state, opts = {}) {
+    await this._applyBlindStateLocally(endpointNum, state, opts);
+  }
+
   _startHealthCheck() {
     if (this._healthCheckInterval) {
       this.homey.clearInterval(this._healthCheckInterval);
@@ -165,13 +313,15 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   async _checkDeviceHealth() {
     const typedEndpoints = Object.entries(this._endpointTypes || {}).filter(([, type]) => type);
     const capabilityCount = this.getCapabilities().filter(
-      c => c.startsWith('onoff.ep') || c.startsWith('dim.ep')
+      c =>
+        c.startsWith('onoff.ep') ||
+        c.startsWith('dim.ep') ||
+        c.startsWith('windowcoverings_state.ep')
     ).length;
 
     const typesLost = typedEndpoints.length === 0 && capabilityCount > 0;
     const capabilitiesMissing = typedEndpoints.some(([id, type]) => {
-      const cap = type === WallWandDevice.DEVICE_TYPES.DIMMER ? `dim.ep${id}` : `onoff.ep${id}`;
-      return !this.hasCapability(cap);
+      return !this.hasCapability(this._expectedCapabilityFor(id, type));
     });
 
     if (typesLost || capabilitiesMissing) {
@@ -190,6 +340,14 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     }
 
     await this._retryUnverifiedEndpoints();
+  }
+
+  // The primary capability that an endpoint of the given type must carry
+  _expectedCapabilityFor(endpointNum, type) {
+    if (type === WallWandDevice.DEVICE_TYPES.BLIND) {
+      return `windowcoverings_state.ep${endpointNum}`;
+    }
+    return `onoff.ep${endpointNum}`;
   }
 
   // Endpoints typed off the cached interview get one live probe attempt per cycle
@@ -212,22 +370,18 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     }
   }
 
-  async _getEndpointAutocompleteList(query, dimmersOnly = false) {
+  // typeFilter is null (all supported endpoints), 'blind', or 'switch'
+  async _getEndpointAutocompleteList(query, typeFilter = null) {
     const items = [];
-    for (const id in this._endpointTypes) {
-      if (this._endpointTypes[id]) {
-        const endpointNum = parseInt(id, 10);
-        const isDimmer = this._endpointTypes[id] === WallWandDevice.DEVICE_TYPES.DIMMER;
+    for (const [id, type] of Object.entries(this._endpointTypes)) {
+      if (!type) continue;
+      if (typeFilter && type !== typeFilter) continue;
 
-        if (dimmersOnly && !isDimmer) {
-          continue;
-        }
-
-        items.push({
-          name: this._getEndpointLabel(endpointNum),
-          id: endpointNum,
-        });
-      }
+      const endpointNum = parseInt(id, 10);
+      items.push({
+        name: this._getEndpointLabel(endpointNum),
+        id: endpointNum,
+      });
     }
     return items.filter(item => item.name.toLowerCase().includes(query.toLowerCase()));
   }
@@ -285,33 +439,28 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     const value = report.Value;
     this.log(`[BASIC] EP${endpointNum} BASIC_SET value=${value}`);
 
-    const onoffCap = `onoff.ep${endpointNum}`;
-    const dimCap = `dim.ep${endpointNum}`;
-
     if (deviceType === WallWandDevice.DEVICE_TYPES.SWITCH) {
+      const onoffCap = `onoff.ep${endpointNum}`;
       await this._setOnOff(onoffCap, value > 0, endpointNum);
       return;
     }
 
-    // Dimmer turned on to its previous level; the level has to be read back
-    if (value === 255) {
-      await this._setOnOff(onoffCap, true, endpointNum);
-      const endpoint = this.node?.MultiChannelNodes?.[endpointNum];
-      if (endpoint) {
-        await this._syncOneEndpointState(endpointNum, endpoint);
-      }
-      return;
+    if (deviceType === WallWandDevice.DEVICE_TYPES.BLIND) {
+      // Best-effort and untested: these blinds emit no frames on physical use,
+      // so this path is effectively dead on real hardware. If a BASIC_SET ever
+      // does arrive, map it optimistically with NO read-back GET (there is no
+      // position to read). 255 -> up (open relay), anything else -> down.
+      const numeric = this._normalizeMultilevelValue(value);
+      const state = numeric === 255 ? 'up' : 'down';
+      await this._setBlindState(endpointNum, state, { fireTrigger: true });
     }
-
-    await this._setOnOff(onoffCap, value > 0, endpointNum);
-    await this._setDim(dimCap, value / WallWandDevice.Z_WAVE_MAX_DIM_VALUE, endpointNum);
   }
 
   _registerRootDeviceListeners(node) {
     if (node?.CommandClass?.COMMAND_CLASS_SWITCH_MULTILEVEL) {
       node.CommandClass.COMMAND_CLASS_SWITCH_MULTILEVEL.on(
         'report',
-        this._createRootReportListener(WallWandDevice.DEVICE_TYPES.DIMMER)
+        this._createRootReportListener(WallWandDevice.DEVICE_TYPES.BLIND)
       );
     }
 
@@ -456,23 +605,8 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     }
   }
 
-  // Blind reports carry no position on this hardware (0 whether open or closed),
-  // so only a genuine 1-99 level may reach the capabilities; everything else is
-  // ignored by returning null (homey-zwavedriver skips the write)
-  _blindOnoffReportParser(report) {
-    const value = this._normalizeMultilevelValue(this._extractReportValue(report));
-    if (typeof value !== 'number' || value === 0) return null;
-    return true;
-  }
-
-  _blindDimReportParser(report) {
-    const value = this._normalizeMultilevelValue(this._extractReportValue(report));
-    if (typeof value !== 'number' || value === 0 || value === 255) return null;
-    return Math.min(value / WallWandDevice.Z_WAVE_MAX_DIM_VALUE, 1);
-  }
-
   _detectEndpointType(endpoint, commandClass) {
-    const isDimmer =
+    const isBlind =
       endpoint.deviceClassGeneric === 'GENERIC_TYPE_SWITCH_MULTILEVEL' &&
       commandClass.COMMAND_CLASS_SWITCH_MULTILEVEL;
 
@@ -480,7 +614,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       endpoint.deviceClassGeneric === 'GENERIC_TYPE_SWITCH_BINARY' &&
       commandClass.COMMAND_CLASS_SWITCH_BINARY;
 
-    if (isDimmer) return WallWandDevice.DEVICE_TYPES.DIMMER;
+    if (isBlind) return WallWandDevice.DEVICE_TYPES.BLIND;
     if (isSwitch) return WallWandDevice.DEVICE_TYPES.SWITCH;
     return null;
   }
@@ -537,7 +671,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       return WallWandDevice.DEVICE_TYPES.SWITCH;
     }
     if (genericClass === 17 && supportsCc(0x26)) {
-      return WallWandDevice.DEVICE_TYPES.DIMMER;
+      return WallWandDevice.DEVICE_TYPES.BLIND;
     }
     return null;
   }
@@ -610,34 +744,17 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     const cachedCc =
       cachedCommandClass || this.node?.MultiChannelNodes?.[endpointNum]?.CommandClass || {};
 
-    if (deviceType === WallWandDevice.DEVICE_TYPES.DIMMER) {
-      await this._ensureCapability(onoffCap);
-      await this._ensureCapability(dimCap);
+    if (deviceType === WallWandDevice.DEVICE_TYPES.BLIND) {
+      const stateCap = `windowcoverings_state.ep${endpointNum}`;
+      await this._ensureCapability(stateCap);
+      // Strip any stale dimmer-era capabilities a paired device still carries
+      await this._removeIfPresent(onoffCap);
+      await this._removeIfPresent(dimCap);
       await this._delay(WallWandDevice.CAPABILITY_SETTLE_DELAY_MS);
-      // The library's report parsers would otherwise write the panel's meaningless
-      // 0-reports straight into the capabilities, bypassing _syncDimmerState.
-      // reportParserOverride is required, or the version-specific system parsers
-      // (reportParserV4) still win (ZwaveDevice.js resolves V{n} parsers first)
-      const blindOnoffOpts = {
-        reportParser: report => this._blindOnoffReportParser(report),
-        reportParserOverride: true,
-      };
-      const blindDimOpts = {
-        reportParser: report => this._blindDimReportParser(report),
-        reportParserOverride: true,
-      };
-      if (cachedCc.COMMAND_CLASS_SWITCH_MULTILEVEL) {
-        this._registerCapabilitySafe(onoffCap, 'SWITCH_MULTILEVEL', endpointNum, blindOnoffOpts);
-        this._registerCapabilitySafe(dimCap, 'SWITCH_MULTILEVEL', endpointNum, blindDimOpts);
-      } else if (cachedCc.COMMAND_CLASS_BASIC) {
-        this.log(`[CAPABILITY] EP${endpointNum} cached node lacks SWITCH_MULTILEVEL, using BASIC`);
-        this._registerCapabilitySafe(onoffCap, 'BASIC', endpointNum, blindOnoffOpts);
-        this._registerCapabilitySafe(dimCap, 'BASIC', endpointNum, blindDimOpts);
-      } else {
-        this.error(
-          `[CAPABILITY] EP${endpointNum} cached node has neither SWITCH_MULTILEVEL nor BASIC, skipping registration`
-        );
-      }
+      // homey-zwavedriver has no system map for windowcoverings_state over
+      // SWITCH_MULTILEVEL (only SWITCH_BINARY), so registerCapability would
+      // silently no-op the SET. Drive the raw frame through a manual listener.
+      this._registerBlindListener(endpointNum);
     } else if (deviceType === WallWandDevice.DEVICE_TYPES.SWITCH) {
       await this._ensureCapability(onoffCap);
       await this._delay(WallWandDevice.CAPABILITY_SETTLE_DELAY_MS);
@@ -737,12 +854,11 @@ module.exports = class WallWandDevice extends ZwaveDevice {
 
     const commandClass = endpoint.CommandClass || {};
     const onoffCap = `onoff.ep${endpointNum}`;
-    const dimCap = `dim.ep${endpointNum}`;
 
     try {
       let syncSuccess = false;
-      if (deviceType === WallWandDevice.DEVICE_TYPES.DIMMER) {
-        syncSuccess = await this._syncDimmerState(endpointNum, commandClass, onoffCap, dimCap);
+      if (deviceType === WallWandDevice.DEVICE_TYPES.BLIND) {
+        syncSuccess = await this._syncBlindState(endpointNum);
       } else if (deviceType === WallWandDevice.DEVICE_TYPES.SWITCH) {
         syncSuccess = await this._syncSwitchState(endpointNum, commandClass, onoffCap);
       }
@@ -793,41 +909,19 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     return new Promise(resolve => this.homey.setTimeout(resolve, ms));
   }
 
-  async _syncDimmerState(endpointNum, commandClass, onoffCap, dimCap) {
-    await this._ensureCapability(onoffCap);
-    await this._ensureCapability(dimCap);
+  // Blinds carry no readable position on this hardware (a GET returns 0 whether
+  // open or closed) and physical operation transmits nothing, so there is
+  // nothing to poll. Just ensure the cover capability exists and seed 'idle' at
+  // boot (the one honest thing known: the motor is not being driven). No GET.
+  async _syncBlindState(endpointNum) {
+    const stateCap = `windowcoverings_state.ep${endpointNum}`;
+    await this._ensureCapability(stateCap);
 
-    const cc = commandClass.COMMAND_CLASS_SWITCH_MULTILEVEL;
-    if (!cc || typeof cc.SWITCH_MULTILEVEL_GET !== 'function') {
-      this.error(`[SYNC] EP${endpointNum} SWITCH_MULTILEVEL not available`);
-      return false;
+    if (this.getCapabilityValue(stateCap) == null) {
+      await this.setCapabilityValue(stateCap, 'idle').catch(err => {
+        this.log(`[SYNC] EP${endpointNum} note seeding idle: ${err.message || err.toString()}`);
+      });
     }
-
-    const report = await cc.SWITCH_MULTILEVEL_GET();
-    const dimValue = this._normalizeMultilevelValue(this._extractReportValue(report));
-
-    if (dimValue === undefined) {
-      return false;
-    }
-
-    // These blinds report 0 regardless of position, so 0 only proves the
-    // endpoint is alive; writing it into the capabilities would fabricate state
-    if (dimValue === 0) {
-      this.log(
-        `[SYNC] EP${endpointNum} multilevel reports 0 - position unknown on this hardware, leaving state unchanged`
-      );
-      return true;
-    }
-
-    if (dimValue === 255) {
-      this.log(`[SYNC] EP${endpointNum} multilevel reports 255, marking on (level unknown)`);
-      await this._setOnOff(onoffCap, true, endpointNum);
-      return true;
-    }
-
-    this.log(`[SYNC] EP${endpointNum} dimmer: ${dimValue}/${WallWandDevice.Z_WAVE_MAX_DIM_VALUE}`);
-    await this._setOnOff(onoffCap, true, endpointNum);
-    await this._setDim(dimCap, dimValue / WallWandDevice.Z_WAVE_MAX_DIM_VALUE, endpointNum);
     return true;
   }
 
@@ -869,12 +963,14 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   }
 
   // Older versions wrote the blinds' always-0 multilevel report into onoff/dim
-  // as off/0%, which was fabricated. Clear those once so the state reads unknown.
+  // as off/0%, which was fabricated. The blind remodel removes onoff/dim from
+  // blind endpoints entirely (so the fabricated values are gone with the
+  // capability); this defensively clears any that linger, once.
   async _resetBlindStateOnce() {
     if (await this.getStoreValue('blindStateResetDone')) return;
 
     for (const id of Object.keys(this._endpointTypes)) {
-      if (this._endpointTypes[id] !== WallWandDevice.DEVICE_TYPES.DIMMER) continue;
+      if (this._endpointTypes[id] !== WallWandDevice.DEVICE_TYPES.BLIND) continue;
       const endpointNum = parseInt(id, 10);
       for (const cap of [`onoff.ep${endpointNum}`, `dim.ep${endpointNum}`]) {
         if (!this.hasCapability(cap)) continue;
@@ -884,7 +980,6 @@ module.exports = class WallWandDevice extends ZwaveDevice {
           this.log(`[MIGRATION] Note resetting ${cap}: ${error.message || error.toString()}`);
         }
       }
-      this.log(`[MIGRATION] EP${endpointNum} blind state reset to unknown`);
     }
 
     await this.setStoreValue('blindStateResetDone', true);
@@ -915,7 +1010,11 @@ module.exports = class WallWandDevice extends ZwaveDevice {
         !Object.prototype.hasOwnProperty.call(this._endpointTypes, i) ||
         this._endpointTypes[i] === null
       ) {
-        if (this.hasCapability(`onoff.ep${i}`) || this.hasCapability(`dim.ep${i}`)) {
+        if (
+          this.hasCapability(`onoff.ep${i}`) ||
+          this.hasCapability(`dim.ep${i}`) ||
+          this.hasCapability(`windowcoverings_state.ep${i}`)
+        ) {
           this.log(`[CLEANUP] EP${i} is orphaned or unsupported, removing capabilities`);
           await this._removeEndpointCapabilities(i);
         }
@@ -941,37 +1040,41 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       .replace(/[<>]/g, ''); // Remove potential HTML
   }
 
+  // The capability whose title carries the user-facing label for an endpoint
+  _primaryCapabilityFor(endpointNum) {
+    const type = this._endpointTypes[endpointNum];
+    if (type === WallWandDevice.DEVICE_TYPES.BLIND) {
+      return `windowcoverings_state.ep${endpointNum}`;
+    }
+    return `onoff.ep${endpointNum}`;
+  }
+
   async _applyLabelToEndpoint(endpointNum, settings) {
     const customLabel = this._sanitizeLabel(settings[`label_ep${endpointNum}`]);
 
-    const onoffCap = `onoff.ep${endpointNum}`;
-    const dimCap = `dim.ep${endpointNum}`;
-    const isDimmer = this._endpointTypes[endpointNum] === WallWandDevice.DEVICE_TYPES.DIMMER;
-    const capId = isDimmer ? dimCap : onoffCap;
+    const isBlind = this._endpointTypes[endpointNum] === WallWandDevice.DEVICE_TYPES.BLIND;
+    const capId = this._primaryCapabilityFor(endpointNum);
 
-    const defaultLabel = this._getDefaultLabel(endpointNum, isDimmer, capId);
+    const defaultLabel = this._getDefaultLabel(endpointNum, isBlind, capId);
     const finalLabel = customLabel || defaultLabel;
 
     try {
-      if (this.hasCapability(onoffCap)) {
-        await this._setTitle(onoffCap, finalLabel);
-      }
-      if (isDimmer && this.hasCapability(dimCap)) {
-        await this._setTitle(dimCap, finalLabel);
+      if (this.hasCapability(capId)) {
+        await this._setTitle(capId, finalLabel);
       }
     } catch (error) {
       this.error(`[LABEL] Failed to set label for EP${endpointNum}:`, error.message || error);
     }
   }
 
-  _getDefaultLabel(endpointNum, isDimmer, capabilityId) {
+  _getDefaultLabel(endpointNum, isBlind, capabilityId) {
     const manifestDefault = this.driver?.manifest?.capabilitiesOptions?.[capabilityId]?.title?.en;
 
     if (manifestDefault) {
       return manifestDefault;
     }
 
-    const typeLabel = isDimmer ? 'Blind' : 'Switch';
+    const typeLabel = isBlind ? 'Blind' : 'Switch';
     return `${typeLabel} ${endpointNum}`;
   }
 
@@ -991,6 +1094,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   async _removeEndpointCapabilities(endpointNum) {
     await this._removeIfPresent(`dim.ep${endpointNum}`);
     await this._removeIfPresent(`onoff.ep${endpointNum}`);
+    await this._removeIfPresent(`windowcoverings_state.ep${endpointNum}`);
   }
 
   _blankLabels() {
@@ -1038,9 +1142,9 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   _getEndpointLabel(endpointNum) {
     const settings = this.getSettings();
     const customLabel = this._sanitizeLabel(settings[`label_ep${endpointNum}`]);
-    const isDimmer = this._endpointTypes[endpointNum] === WallWandDevice.DEVICE_TYPES.DIMMER;
-    const capId = isDimmer ? `dim.ep${endpointNum}` : `onoff.ep${endpointNum}`;
-    const defaultLabel = this._getDefaultLabel(endpointNum, isDimmer, capId);
+    const isBlind = this._endpointTypes[endpointNum] === WallWandDevice.DEVICE_TYPES.BLIND;
+    const capId = this._primaryCapabilityFor(endpointNum);
+    const defaultLabel = this._getDefaultLabel(endpointNum, isBlind, capId);
     return customLabel || defaultLabel;
   }
 
@@ -1081,12 +1185,12 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     await this._triggerEndpoint('endpoint_turned_off', endpointNum);
   }
 
-  async _triggerEndpointDimChanged(endpointNum, dimValue) {
-    await this._triggerEndpoint('endpoint_dim_changed', endpointNum, { dim_value: dimValue });
-  }
-
   async _triggerEndpointStateChanged(endpointNum, state) {
     await this._triggerEndpoint('endpoint_state_changed', endpointNum, { state });
+  }
+
+  async _triggerBlindStateChanged(endpointNum, state) {
+    await this._triggerEndpoint('blind_state_changed', endpointNum, { state });
   }
 
   async _setOnOff(cap, value, endpointNum) {
@@ -1126,38 +1230,6 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     }
 
     await this._triggerEndpointStateChanged(endpointNum, newValue);
-  }
-
-  async _setDim(cap, value01, endpointNum) {
-    if (!cap || typeof cap !== 'string') {
-      this.error('[DIM] Invalid capability ID');
-      return;
-    }
-
-    const normalizedValue = Math.max(0, Math.min(1, Number(value01) || 0));
-
-    if (!this.hasCapability(cap)) {
-      // Silently ignore if capability doesn't exist yet (race condition during discovery)
-      return;
-    }
-
-    const oldValue = this.getCapabilityValue(cap);
-
-    try {
-      await this.setCapabilityValue(cap, normalizedValue);
-    } catch (err) {
-      const errorMsg = err.message || err.toString();
-      // Only log non-race-condition errors
-      if (!errorMsg.includes('Invalid Capability')) {
-        this.error(`[DIM] Failed to set ${cap} to ${normalizedValue}: ${errorMsg}`);
-      }
-      return;
-    }
-
-    if (oldValue === normalizedValue) return;
-    if (!this._initialSyncDone) return;
-
-    await this._triggerEndpointDimChanged(endpointNum, normalizedValue);
   }
 
   async _handleEndpointIsOn(args) {
@@ -1205,5 +1277,22 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       default:
         return false;
     }
+  }
+
+  async _handleBlindStateIs(args) {
+    if (!args.endpoint?.id) {
+      this.error('[FLOW] Invalid endpoint in condition');
+      return false;
+    }
+
+    const endpointNum = args.endpoint.id;
+    if (this._endpointTypes[endpointNum] !== WallWandDevice.DEVICE_TYPES.BLIND) {
+      this.error(`[FLOW] Endpoint ${endpointNum} is not a blind`);
+      return false;
+    }
+
+    const cap = `windowcoverings_state.ep${endpointNum}`;
+    if (!this.hasCapability(cap)) return false;
+    return this.getCapabilityValue(cap) === args.state;
   }
 };

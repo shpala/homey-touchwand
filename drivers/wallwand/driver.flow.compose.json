@@ -86,6 +86,7 @@
     },
     {
       "id": "endpoint_dim_changed",
+      "deprecated": true,
       "title": {
         "en": "Endpoint dimmer changed"
       },
@@ -181,6 +182,56 @@
             "en": "State"
           },
           "example": true
+        }
+      ]
+    },
+    {
+      "id": "blind_state_changed",
+      "title": {
+        "en": "Blind moved"
+      },
+      "titleFormatted": {
+        "en": "[[endpoint]] moved"
+      },
+      "hint": {
+        "en": "Triggered when a blind endpoint starts opening, closing, or stops."
+      },
+      "args": [
+        {
+          "type": "autocomplete",
+          "name": "endpoint",
+          "title": {
+            "en": "Endpoint (Blind)"
+          },
+          "placeholder": {
+            "en": "Select blind endpoint"
+          }
+        }
+      ],
+      "tokens": [
+        {
+          "name": "endpoint_id",
+          "type": "number",
+          "title": {
+            "en": "Endpoint ID"
+          },
+          "example": 1
+        },
+        {
+          "name": "endpoint_label",
+          "type": "string",
+          "title": {
+            "en": "Endpoint Label"
+          },
+          "example": "Living Room Blind"
+        },
+        {
+          "name": "state",
+          "type": "string",
+          "title": {
+            "en": "State"
+          },
+          "example": "up"
         }
       ]
     }

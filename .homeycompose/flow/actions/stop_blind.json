@@ -1,0 +1,29 @@
+{
+  "id": "stop_blind",
+  "title": {
+    "en": "Stop blind"
+  },
+  "titleFormatted": {
+    "en": "Stop [[endpoint]]"
+  },
+  "hint": {
+    "en": "Stop a moving WallWand blind endpoint."
+  },
+  "args": [
+    {
+      "name": "device",
+      "type": "device",
+      "filter": "driver_id=wallwand"
+    },
+    {
+      "name": "endpoint",
+      "type": "autocomplete",
+      "title": {
+        "en": "Endpoint (Blind)"
+      },
+      "placeholder": {
+        "en": "Select blind endpoint"
+      }
+    }
+  ]
+}
