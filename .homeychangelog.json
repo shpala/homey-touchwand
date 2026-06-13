@@ -22,5 +22,8 @@
   },
   "0.2.0": {
     "en": "Blinds now use proper up/stop/down controls instead of a dimmer slider, with new Open, Close, Stop and 'Blind moved' flow cards and a configurable travel time. Paired panels migrate automatically. The old dimmer flow cards are deprecated."
+  },
+  "0.2.2": {
+    "en": "Blinds now use proper up/stop/down controls instead of a dimmer slider, with new Open, Close, Stop and 'Blind moved' flow cards and a configurable travel time. Paired panels migrate automatically. The old dimmer flow cards are deprecated."
   }
 }
