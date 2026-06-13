@@ -154,6 +154,65 @@ function makeNode(endpoints = {}) {
   };
 }
 
+// Entrance EP2: the cached interview is stuck on the factory multilevel layout.
+// The endpoint object lists SWITCH_MULTILEVEL (with a forever-timing-out GET) but
+// has NEITHER SWITCH_BINARY NOR BASIC, so registerCapability has no CC to bind to.
+// It also carries an EventEmitter-style _report emitter (verified on hardware: raw
+// reports fire '_report' on node.MultiChannelNodes[ep] even with no CC object).
+function makeEncapSwitchEndpoint() {
+  const reportListeners = [];
+  return {
+    deviceClassGeneric: 'GENERIC_TYPE_SWITCH_MULTILEVEL',
+    CommandClass: {
+      COMMAND_CLASS_SWITCH_MULTILEVEL: makeCommandClassMock({
+        SWITCH_MULTILEVEL_GET: jest.fn().mockRejectedValue(new Error('timeout after 10000ms')),
+      }),
+    },
+    on: jest.fn((event, cb) => {
+      if (event === '_report') reportListeners.push(cb);
+    }),
+    removeListener: jest.fn((event, cb) => {
+      if (event !== '_report') return;
+      const idx = reportListeners.indexOf(cb);
+      if (idx !== -1) reportListeners.splice(idx, 1);
+    }),
+    // Test helper: synthesize an inbound report to every registered listener
+    emitReport(payload) {
+      for (const cb of [...reportListeners]) cb(payload);
+    },
+    _reportListenerCount() {
+      return reportListeners.length;
+    },
+  };
+}
+
+// Live capability report shaped like the real '_report' event for the encap path.
+// commandClass distinguishes a GET response (SWITCH_BINARY) from a physical wall
+// press (BASIC / BASIC_SET); the on-value lives in args[1].
+function makeEncapReport(commandClass, value) {
+  return {
+    event: 'report',
+    commandClass,
+    args: [
+      { value: 3, name: 'SWITCH_BINARY_REPORT' },
+      { 'Current Value (Raw)': Buffer.from([0]), 'Current Value': value, Value: value },
+      43,
+    ],
+    token: 'tok',
+  };
+}
+
+// Attaches the root MULTI_CHANNEL_CMD_ENCAP used by the encap switch fallback.
+// Returns a 'TRANSMIT_COMPLETE_OK' on every send.
+function addMultiChannelCmdEncap(node) {
+  const existing = node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL;
+  node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL = makeCommandClassMock({
+    ...(existing || {}),
+    MULTI_CHANNEL_CMD_ENCAP: jest.fn().mockResolvedValue('TRANSMIT_COMPLETE_OK'),
+  });
+  return node;
+}
+
 // Shape verified on real hardware: numeric device classes plus a raw CC id buffer
 function makeLiveCapabilityReport(endpointNum, genericClass, commandClassIds) {
   return {
@@ -995,13 +1054,266 @@ describe('WallWandDevice', () => {
   });
 
   describe('capability registration fallbacks', () => {
-    test('skips registration without crashing when the cache lacks the typed CC and BASIC', async () => {
+    test('uses the encap fallback (not registerCapability) when the cache lacks the typed CC and BASIC', async () => {
+      // The stale cache lacks SWITCH_BINARY and BASIC, so registerCapability has
+      // no CC to bind to; the endpoint is driven via raw multi-channel encap.
+      const node = makeNode({ 1: makeEncapSwitchEndpoint() });
+      addMultiChannelCmdEncap(node);
+      device.node = node;
       const regSpy = jest.spyOn(device, 'registerCapability');
+      const listenerSpy = jest.spyOn(device, 'registerCapabilityListener');
 
       await device._registerEndpointCapabilities(1, DEVICE_TYPES.SWITCH, {});
 
       expect(regSpy).not.toHaveBeenCalled();
       expect(device.hasCapability('onoff.ep1')).toBe(true);
+      expect(listenerSpy).toHaveBeenCalledWith('onoff.ep1', expect.any(Function));
+      expect(device._encapSwitches.has(1)).toBe(true);
+      // The raw '_report' listener is attached on the multi-channel node object
+      expect(node.MultiChannelNodes[1]._reportListenerCount()).toBe(1);
+    });
+  });
+
+  describe('encap switch fallback (stale-cache switch endpoint)', () => {
+    let node;
+    let endpoint;
+    let encapCc;
+
+    beforeEach(async () => {
+      endpoint = makeEncapSwitchEndpoint();
+      node = makeNode({ 2: endpoint });
+      addMultiChannelCmdEncap(node);
+      encapCc = node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL;
+      device.node = node;
+      device._endpointTypes = { 2: DEVICE_TYPES.SWITCH };
+      await device.addCapability('onoff.ep2');
+      device._initialSyncDone = true;
+    });
+
+    test('registers the encap fallback: a capability listener and a _report listener, no registerCapability', async () => {
+      const regSpy = jest.spyOn(device, 'registerCapability');
+      const listenerSpy = jest.spyOn(device, 'registerCapabilityListener');
+
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      expect(regSpy).not.toHaveBeenCalled();
+      expect(listenerSpy).toHaveBeenCalledWith('onoff.ep2', expect.any(Function));
+      expect(endpoint._reportListenerCount()).toBe(1);
+      expect(device._encapSwitches.has(2)).toBe(true);
+    });
+
+    test('sends an initial encap GET on registration so the value seeds', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      // The seed GET uses Command 0x02 (SWITCH_BINARY_GET) with an empty Parameter
+      expect(encapCc.MULTI_CHANNEL_CMD_ENCAP).toHaveBeenCalledWith(
+        expect.objectContaining({
+          'Command Class': 0x25,
+          Command: 0x02,
+        })
+      );
+    });
+
+    test('driving onoff true sends an encap SWITCH_BINARY_SET 0xFF and sets the value optimistically', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+      encapCc.MULTI_CHANNEL_CMD_ENCAP.mockClear();
+
+      await device.triggerCapabilityListener('onoff.ep2', true);
+
+      expect(encapCc.MULTI_CHANNEL_CMD_ENCAP).toHaveBeenCalledTimes(1);
+      const arg = encapCc.MULTI_CHANNEL_CMD_ENCAP.mock.calls[0][0];
+      expect(Buffer.isBuffer(arg.Properties1)).toBe(true);
+      expect([...arg.Properties1]).toEqual([0]);
+      expect(Buffer.isBuffer(arg.Properties2)).toBe(true);
+      expect([...arg.Properties2]).toEqual([2]);
+      expect(arg['Command Class']).toBe(0x25);
+      expect(arg.Command).toBe(0x01);
+      expect(Buffer.isBuffer(arg.Parameter)).toBe(true);
+      expect([...arg.Parameter]).toEqual([0xff]);
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+    });
+
+    test('driving onoff false sends an encap SWITCH_BINARY_SET 0x00', async () => {
+      await device.setCapabilityValue('onoff.ep2', true);
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+      encapCc.MULTI_CHANNEL_CMD_ENCAP.mockClear();
+
+      await device.triggerCapabilityListener('onoff.ep2', false);
+
+      const arg = encapCc.MULTI_CHANNEL_CMD_ENCAP.mock.calls[0][0];
+      expect(arg.Command).toBe(0x01);
+      expect([...arg.Parameter]).toEqual([0x00]);
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(false);
+    });
+
+    test('a transient drive error does not reject the listener', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+      encapCc.MULTI_CHANNEL_CMD_ENCAP.mockRejectedValueOnce(new Error('timeout after 10000ms'));
+
+      await expect(device.triggerCapabilityListener('onoff.ep2', true)).resolves.toBeUndefined();
+    });
+
+    test('the first (seed) report applies silently without firing a trigger', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      // The seed GET reply lands after _initialSyncDone is already true; it must not
+      // fire a boot-time endpoint_turned_on the way a runtime change would
+      endpoint.emitReport(makeEncapReport('COMMAND_CLASS_SWITCH_BINARY', 'on/enable'));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+      expect(
+        device.homey.flow.getDeviceTriggerCard('endpoint_turned_on').trigger
+      ).not.toHaveBeenCalled();
+    });
+
+    test('a report after the seed sets onoff and fires triggers', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      // seed first (silent), then a real change
+      endpoint.emitReport(makeEncapReport('COMMAND_CLASS_SWITCH_BINARY', 'off/disable'));
+      await new Promise(resolve => setImmediate(resolve));
+      endpoint.emitReport(makeEncapReport('COMMAND_CLASS_SWITCH_BINARY', 'on/enable'));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+      const turnedOn = device.homey.flow.getDeviceTriggerCard('endpoint_turned_on');
+      expect(turnedOn.trigger).toHaveBeenCalled();
+    });
+
+    test('an inbound SWITCH_BINARY _report off/disable sets onoff false', async () => {
+      await device.setCapabilityValue('onoff.ep2', true);
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      endpoint.emitReport(makeEncapReport('COMMAND_CLASS_SWITCH_BINARY', 'off/disable'));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(false);
+    });
+
+    test('an inbound BASIC _report (physical wall press) updates onoff', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      endpoint.emitReport(makeEncapReport('COMMAND_CLASS_BASIC', 'on/enable'));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+
+      endpoint.emitReport(makeEncapReport('COMMAND_CLASS_BASIC', 'off/disable'));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(false);
+    });
+
+    test('a _report with an unusable value is ignored', async () => {
+      await device.setCapabilityValue('onoff.ep2', true);
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      endpoint.emitReport({
+        event: 'report',
+        commandClass: 'COMMAND_CLASS_SWITCH_BINARY',
+        args: [],
+      });
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+    });
+
+    test('a _report for an unrelated command class is ignored', async () => {
+      await device.setCapabilityValue('onoff.ep2', true);
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      endpoint.emitReport(makeEncapReport('COMMAND_CLASS_NOTIFICATION', 'off/disable'));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+    });
+
+    test('sync sends the encap GET (Command 0x02) and counts a transmit as success', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+      encapCc.MULTI_CHANNEL_CMD_ENCAP.mockClear();
+      device._syncFailureCounts[2] = 0;
+
+      await device._syncOneEndpointState(2, endpoint);
+
+      // No cached SWITCH_BINARY_GET path - only the raw encap GET
+      expect(encapCc.MULTI_CHANNEL_CMD_ENCAP).toHaveBeenCalledTimes(1);
+      const arg = encapCc.MULTI_CHANNEL_CMD_ENCAP.mock.calls[0][0];
+      expect(arg.Command).toBe(0x02);
+      expect(Buffer.isBuffer(arg.Parameter)).toBe(true);
+      expect([...arg.Parameter]).toEqual([]);
+      expect(device._syncFailureCounts[2]).toBe(0);
+    });
+
+    test('re-registering does not stack duplicate _report listeners', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+
+      expect(endpoint._reportListenerCount()).toBe(1);
+    });
+
+    test('removing the endpoint capabilities detaches the _report listener', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+      expect(endpoint._reportListenerCount()).toBe(1);
+
+      await device._removeEndpointCapabilities(2);
+
+      expect(endpoint._reportListenerCount()).toBe(0);
+      expect(device._encapSwitches.has(2)).toBe(false);
+    });
+
+    test('onDeleted detaches the _report listener', async () => {
+      await device._registerEndpointCapabilities(2, DEVICE_TYPES.SWITCH, endpoint.CommandClass);
+      expect(endpoint._reportListenerCount()).toBe(1);
+
+      await device.onDeleted();
+
+      expect(endpoint._reportListenerCount()).toBe(0);
+    });
+  });
+
+  describe('encap switch full discovery', () => {
+    test('a live-typed switch with a stale multilevel cache wires the encap fallback end to end', async () => {
+      const endpoint = makeEncapSwitchEndpoint();
+      const node = makeNode({ 2: endpoint });
+      addMultiChannelCommandClass(node, { 2: makeLiveCapabilityReport(2, 16, [0x25, 0x85]) });
+      addMultiChannelCmdEncap(node);
+      device.node = node;
+
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[2]).toBe(DEVICE_TYPES.SWITCH);
+      expect(device.hasCapability('onoff.ep2')).toBe(true);
+      expect(device._encapSwitches.has(2)).toBe(true);
+      expect(endpoint._reportListenerCount()).toBe(1);
+
+      // A physical press now flows through the _report listener
+      endpoint.emitReport(makeEncapReport('COMMAND_CLASS_BASIC', 'on/enable'));
+      await new Promise(resolve => setImmediate(resolve));
+      expect(device.getCapabilityValue('onoff.ep2')).toBe(true);
+    });
+
+    test('a normal switch (cached SWITCH_BINARY present) is untouched by the encap path', async () => {
+      const node = makeNode({ 3: makeBinaryEndpoint(255) });
+      addMultiChannelCommandClass(node, { 3: makeLiveCapabilityReport(3, 16, [0x25, 0x85]) });
+      addMultiChannelCmdEncap(node);
+      device.node = node;
+      const regSpy = jest.spyOn(device, 'registerCapability');
+
+      await device.onNodeInit({ node });
+
+      expect(device._endpointTypes[3]).toBe(DEVICE_TYPES.SWITCH);
+      expect(device._encapSwitches.has(3)).toBe(false);
+      // Normal switches keep the library registerCapability path
+      expect(regSpy).toHaveBeenCalledWith(
+        'onoff.ep3',
+        'SWITCH_BINARY',
+        expect.objectContaining({ multiChannelNodeId: 3, getOpts: { getOnStart: false } })
+      );
+      // The encap CMD_ENCAP must not have been used to drive a normal switch
+      expect(
+        node.CommandClass.COMMAND_CLASS_MULTI_CHANNEL.MULTI_CHANNEL_CMD_ENCAP
+      ).not.toHaveBeenCalled();
     });
   });
 

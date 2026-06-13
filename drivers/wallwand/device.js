@@ -23,6 +23,15 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   static VERIFY_RETRY_DELAY_MS = 400; // Lets the panel's duplicate-report bursts drain before retrying
   static BLIND_SET_DURATION = 255; // 0xFF = use the panel's own configured shutter travel time (required numeric field on v4 SET)
 
+  // Raw multi-channel encapsulation for switch endpoints whose cached interview is
+  // stuck on the factory multilevel layout (no SWITCH_BINARY / BASIC CC object to
+  // bind registerCapability to). Verified at the wire on the Entrance panel (node 43).
+  static CC_SWITCH_BINARY = 0x25;
+  static SWITCH_BINARY_SET = 0x01;
+  static SWITCH_BINARY_GET = 0x02;
+  static SWITCH_ON = 0xff;
+  static SWITCH_OFF = 0x00;
+
   async onInit() {
     await super.onInit();
     this.log(`[WallWand Device onInit] ${this.getName()} created`);
@@ -35,6 +44,14 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     this._endpointTypesVerified = {};
     this._liveGenericClasses = {};
     this._syncFailureCounts = {};
+    // Endpoints driven via raw multi-channel encapsulation (stale-cache switches),
+    // and the '_report' listeners attached to their MultiChannelNode objects so they
+    // can be detached on re-registration / delete (super.onDeleted does not touch them).
+    this._encapSwitches = new Set();
+    this._encapReportListeners = {};
+    // Endpoints whose first encap report has been applied; the seed reply lands after
+    // _initialSyncDone flips, so the first one is set silently to avoid a boot-time trigger
+    this._encapSeeded = new Set();
     this._initialSyncDone = false;
 
     this._commandQueue = new CommandQueue(
@@ -60,6 +77,14 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     this._endpointTypes = (await this.getStoreValue('endpointTypes')) || {};
     this._endpointTypesVerified = (await this.getStoreValue('endpointTypesVerified')) || {};
     this._liveGenericClasses = {};
+    // Detach any encap '_report' listeners from a previous init before rediscovery
+    // re-attaches them, so a re-interview never doubles up listeners
+    for (const id of Object.keys(this._encapReportListeners)) {
+      this._detachEncapReportListener(parseInt(id, 10));
+    }
+    this._encapSwitches = new Set();
+    this._encapReportListeners = {};
+    this._encapSeeded = new Set();
     this._initialSyncDone = false;
 
     const verifyGeneration = await this.getStoreValue('endpointVerifyGeneration');
@@ -148,6 +173,14 @@ module.exports = class WallWandDevice extends ZwaveDevice {
 
     Object.values(this._blindTravelTimeouts).forEach(timeout => this.homey.clearTimeout(timeout));
     this._blindTravelTimeouts = {};
+
+    // The encap '_report' listeners live on the MultiChannelNode objects, which
+    // super.onDeleted() does not clean (it only touches root-node CC listeners)
+    for (const id of Object.keys(this._encapReportListeners)) {
+      this._detachEncapReportListener(parseInt(id, 10));
+    }
+    this._encapSwitches = new Set();
+    this._encapSeeded = new Set();
 
     // super.onDeleted() removes all command class listeners on the root node,
     // including the root report listeners registered in onNodeInit
@@ -749,11 +782,138 @@ module.exports = class WallWandDevice extends ZwaveDevice {
         this.log(`[CAPABILITY] EP${endpointNum} cached node lacks SWITCH_BINARY, using BASIC`);
         this._registerCapabilitySafe(onoffCap, 'BASIC', endpointNum);
       } else {
-        this.error(
-          `[CAPABILITY] EP${endpointNum} cached node has neither SWITCH_BINARY nor BASIC, skipping registration`
+        // The stale interview is stuck on the factory multilevel layout: this
+        // endpoint has neither SWITCH_BINARY nor BASIC, so registerCapability has
+        // no CC object to bind to and would silently no-op. Drive it by hand via
+        // raw multi-channel encapsulation against the root COMMAND_CLASS_MULTI_CHANNEL.
+        this.log(
+          `[CAPABILITY] EP${endpointNum} stale cache lacks SWITCH_BINARY/BASIC, using multi-channel encapsulation`
         );
+        this._registerEncapSwitch(endpointNum);
       }
     }
+  }
+
+  // Wires the encapsulation fallback for a stale-cache switch endpoint: a manual
+  // capability listener (registerCapability can't bind a missing CC), a raw
+  // '_report' listener on the MultiChannelNode (catches GET responses and physical
+  // BASIC_SET presses), and one seed GET. Idempotent across re-registration.
+  _registerEncapSwitch(endpointNum) {
+    const onoffCap = `onoff.ep${endpointNum}`;
+    this._encapSwitches.add(endpointNum);
+    // The seed GET reply is the first report; apply it silently (see _onEncapSwitchReport)
+    this._encapSeeded.delete(endpointNum);
+
+    this.registerCapabilityListener(onoffCap, value => this._driveEncapSwitch(endpointNum, value));
+    this._registerEncapSwitchReport(endpointNum);
+
+    // Seed the current value; the '_report' listener applies the reply asynchronously
+    this._encapSwitchGet(endpointNum).catch(err => {
+      this.log(`[ENCAP] EP${endpointNum} initial GET note: ${err.message || err}`);
+    });
+  }
+
+  // Attaches (exactly once) the raw '_report' listener that receives both the encap
+  // SWITCH_BINARY_REPORT (GET response) and the BASIC_SET frames physical presses emit.
+  _registerEncapSwitchReport(endpointNum) {
+    const mcNode = this.node?.MultiChannelNodes?.[endpointNum];
+    if (!mcNode || typeof mcNode.on !== 'function') {
+      this.error(`[ENCAP] EP${endpointNum} has no MultiChannelNode to attach a report listener`);
+      return;
+    }
+
+    // Detach a stale listener first so re-discovery never stacks duplicates
+    this._detachEncapReportListener(endpointNum);
+
+    const listener = payload => this._onEncapSwitchReport(endpointNum, payload);
+    this._encapReportListeners[endpointNum] = listener;
+    mcNode.on('_report', listener);
+  }
+
+  _detachEncapReportListener(endpointNum) {
+    const listener = this._encapReportListeners[endpointNum];
+    if (!listener) return;
+    const mcNode = this.node?.MultiChannelNodes?.[endpointNum];
+    if (mcNode && typeof mcNode.removeListener === 'function') {
+      mcNode.removeListener('_report', listener);
+    }
+    delete this._encapReportListeners[endpointNum];
+  }
+
+  // Applies an inbound encap report (GET response or physical BASIC_SET press) to
+  // the onoff capability, reusing the shared dedupe + trigger path in _setOnOff.
+  async _onEncapSwitchReport(endpointNum, payload) {
+    const cc = payload?.commandClass;
+    if (cc !== 'COMMAND_CLASS_SWITCH_BINARY' && cc !== 'COMMAND_CLASS_BASIC') return;
+
+    const parsed = payload?.args?.[1];
+    if (!parsed || typeof parsed !== 'object') return;
+    const raw = parsed['Current Value'] ?? parsed['Value'];
+    if (raw == null) return;
+
+    const isOn = this._coerceOnOff(raw);
+    const cap = `onoff.ep${endpointNum}`;
+
+    // The first reply is the boot seed; set it silently so it doesn't fire a flow
+    // trigger (normal switches seed synchronously while the trigger gate is still closed)
+    if (!this._encapSeeded.has(endpointNum)) {
+      this._encapSeeded.add(endpointNum);
+      await this.setCapabilityValue(cap, isOn).catch(err => {
+        this.error(`[ENCAP] EP${endpointNum} seed apply failed: ${err.message || err}`);
+      });
+      return;
+    }
+
+    await this._setOnOff(cap, isOn, endpointNum).catch(err => {
+      this.error(`[ENCAP] EP${endpointNum} report apply failed: ${err.message || err}`);
+    });
+  }
+
+  // Maps a binary report value to on/off; shared by encap reports and switch sync
+  _coerceOnOff(raw) {
+    return (
+      raw === 'on/enable' || raw === true || raw === 'true' || (typeof raw === 'number' && raw > 0)
+    );
+  }
+
+  // Sends the verified encap SWITCH_BINARY_SET and optimistically updates onoff.
+  // Not queued: flow actions already serialize via queueCapabilityCommand and UI
+  // taps call this listener directly, mirroring how normal switches behave.
+  async _driveEncapSwitch(endpointNum, value) {
+    const isOn = !!value;
+    try {
+      await this._sendEncapSwitch(
+        endpointNum,
+        WallWandDevice.SWITCH_BINARY_SET,
+        Buffer.from([isOn ? WallWandDevice.SWITCH_ON : WallWandDevice.SWITCH_OFF])
+      );
+      await this._setOnOff(`onoff.ep${endpointNum}`, isOn, endpointNum);
+    } catch (error) {
+      this.log(`[ENCAP] EP${endpointNum} drive ${isOn} failed: ${error.message || error}`);
+    }
+  }
+
+  // Issues an encap SWITCH_BINARY_GET; the value arrives via the '_report' listener.
+  // Returns the transmit result so sync can treat a TRANSMIT_COMPLETE_OK as success.
+  async _encapSwitchGet(endpointNum) {
+    return this._sendEncapSwitch(endpointNum, WallWandDevice.SWITCH_BINARY_GET, Buffer.from([]));
+  }
+
+  // Low-level multi-channel encapsulation send. Properties1 (source EP 0) and
+  // Properties2 (destination EP) MUST be Buffers - the object form throws
+  // invalid_type on Properties1.Res (verified on hardware).
+  async _sendEncapSwitch(endpointNum, command, parameter) {
+    const cc = this.node?.CommandClass?.COMMAND_CLASS_MULTI_CHANNEL;
+    if (!cc || typeof cc.MULTI_CHANNEL_CMD_ENCAP !== 'function') {
+      throw new Error('COMMAND_CLASS_MULTI_CHANNEL not available');
+    }
+    return cc.MULTI_CHANNEL_CMD_ENCAP({
+      Properties1: Buffer.from([0]),
+      Properties2: Buffer.from([endpointNum]),
+      'Command Class': WallWandDevice.CC_SWITCH_BINARY,
+      Command: command,
+      Parameter: parameter,
+    });
   }
 
   _isValidReport(report, requiredField) {
@@ -913,6 +1073,14 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     await this._removeIfPresent(`dim.ep${endpointNum}`);
     await this._ensureCapability(onoffCap);
 
+    // Stale-cache switches have no readable CC object; issue a raw encap GET and
+    // let the '_report' listener update the value. A clean transmit is a success.
+    if (this._encapSwitches?.has(endpointNum)) {
+      const result = await this._encapSwitchGet(endpointNum);
+      this.log(`[SYNC] EP${endpointNum} encap GET sent (${result})`);
+      return true;
+    }
+
     const binaryCc = commandClass.COMMAND_CLASS_SWITCH_BINARY;
     const basicCc = commandClass.COMMAND_CLASS_BASIC;
     let readState;
@@ -932,12 +1100,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     const reportValue = this._extractReportValue(report);
 
     if (reportValue !== undefined) {
-      const isOn =
-        reportValue === 'on/enable' ||
-        reportValue === 1 ||
-        reportValue === 255 ||
-        reportValue === true ||
-        reportValue === 'true';
+      const isOn = this._coerceOnOff(reportValue);
       this.log(`[SYNC] EP${endpointNum} switch: ${isOn}`);
       await this._setOnOff(onoffCap, isOn, endpointNum);
       return true;
@@ -1070,6 +1233,12 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   }
 
   async _removeEndpointCapabilities(endpointNum) {
+    // Drop any encap fallback wiring first so a removed/re-typed endpoint leaves no
+    // dangling '_report' listener and is not still treated as an encap switch
+    this._detachEncapReportListener(endpointNum);
+    this._encapSwitches.delete(endpointNum);
+    this._encapSeeded.delete(endpointNum);
+
     // dim.ep* must stay declared in driver.compose.json so this remove() is allowed on dimmer-era devices
     await this._removeIfPresent(`dim.ep${endpointNum}`);
     await this._removeIfPresent(`onoff.ep${endpointNum}`);

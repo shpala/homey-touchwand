@@ -28,5 +28,8 @@
   },
   "0.2.3": {
     "en": "Internal code cleanup and refactoring. No functional changes."
+  },
+  "0.2.4": {
+    "en": "Fix switches whose Z-Wave interview was stuck on the factory layout (a wired switch that showed no state and ignored the app): they are now driven and kept in sync over multi-channel encapsulation, no re-pairing needed."
   }
 }
