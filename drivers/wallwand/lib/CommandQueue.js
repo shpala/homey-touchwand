@@ -16,12 +16,6 @@ class CommandQueue {
     }
   }
 
-  /**
-   * Enqueues a command to be executed.
-   * @param {Function} executor - Async function to execute the command
-   * @param {string} description - Description of the command for logging
-   * @returns {Promise<void>}
-   */
   async add(executor, description) {
     return new Promise((resolve, reject) => {
       this._queue.push({
@@ -43,11 +37,7 @@ class CommandQueue {
     this._isProcessing = true;
 
     try {
-      while (true) {
-        if (this._queue.length === 0) {
-          break;
-        }
-
+      while (this._queue.length) {
         const command = this._queue.shift();
 
         let execution;
@@ -60,8 +50,7 @@ class CommandQueue {
           command.reject(error);
           this.logger.error(`[QUEUE] Failed: ${command.description} - ${error.message || error}`);
 
-          // On timeout the underlying Z-Wave command is still running and may
-          // overlap with the next one; we can't cancel it, but make it visible
+          // A timed-out Z-Wave command keeps running and can't be cancelled; log if it settles late
           if (error.isTimeout && execution) {
             execution.then(
               () =>

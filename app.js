@@ -34,41 +34,13 @@ class TouchWandApp extends Homey.App {
   }
 
   _registerActionCards() {
-    this._registerAction(
-      'turn_endpoint_on',
-      async args => {
-        const cap = `onoff.ep${args.endpoint.id}`;
-        if (!args.device.hasCapability(cap)) {
-          throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
-        }
-        await args.device.queueCapabilityCommand(cap, true);
-      },
-      SWITCH
+    this._registerOnoffAction('turn_endpoint_on', (device, cap) =>
+      device.queueCapabilityCommand(cap, true)
     );
-
-    this._registerAction(
-      'turn_endpoint_off',
-      async args => {
-        const cap = `onoff.ep${args.endpoint.id}`;
-        if (!args.device.hasCapability(cap)) {
-          throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
-        }
-        await args.device.queueCapabilityCommand(cap, false);
-      },
-      SWITCH
+    this._registerOnoffAction('turn_endpoint_off', (device, cap) =>
+      device.queueCapabilityCommand(cap, false)
     );
-
-    this._registerAction(
-      'toggle_endpoint',
-      async args => {
-        const cap = `onoff.ep${args.endpoint.id}`;
-        if (!args.device.hasCapability(cap)) {
-          throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
-        }
-        await args.device.queueToggleCommand(cap);
-      },
-      SWITCH
-    );
+    this._registerOnoffAction('toggle_endpoint', (device, cap) => device.queueToggleCommand(cap));
 
     // Deprecated: no endpoint carries a dim capability after the blind remodel,
     // so this errors clearly instead of silently doing nothing.
@@ -89,6 +61,20 @@ class TouchWandApp extends Homey.App {
     this._registerBlindAction('open_blind', 'up');
     this._registerBlindAction('close_blind', 'down');
     this._registerBlindAction('stop_blind', 'idle');
+  }
+
+  _registerOnoffAction(id, run) {
+    this._registerAction(
+      id,
+      async args => {
+        const cap = `onoff.ep${args.endpoint.id}`;
+        if (!args.device.hasCapability(cap)) {
+          throw new Error(`Endpoint ${args.endpoint.id} does not have an onoff capability`);
+        }
+        await run(args.device, cap);
+      },
+      SWITCH
+    );
   }
 
   _registerBlindAction(id, state) {

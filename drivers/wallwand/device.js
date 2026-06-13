@@ -37,7 +37,6 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     this._syncFailureCounts = {};
     this._initialSyncDone = false;
 
-    // Initialize command queue
     this._commandQueue = new CommandQueue(
       {
         log: this.log.bind(this),
@@ -65,20 +64,15 @@ module.exports = class WallWandDevice extends ZwaveDevice {
 
     const verifyGeneration = await this.getStoreValue('endpointVerifyGeneration');
     if (verifyGeneration !== WallWandDevice.VERIFY_GENERATION) {
-      // The verification logic changed; earlier results may have been poisoned by
-      // the panel's duplicate-report bursts, so probe everything again once.
-      // Fabricated blind state may have leaked in under the old logic too, so
-      // the one-time null reset reruns as well.
+      // Verification logic changed: re-probe every endpoint and rerun the blind-state
+      // reset, since old verified flags and any fabricated state may now be wrong.
       this._endpointTypesVerified = {};
       await this.setStoreValue('endpointTypesVerified', {});
       await this.setStoreValue('blindStateResetDone', false);
       await this.setStoreValue('endpointVerifyGeneration', WallWandDevice.VERIFY_GENERATION);
     }
 
-    // One-time rename of the old 'dimmer' type to 'blind'. The endpoint is the
-    // same verified multilevel device; only the label changes, so the verified
-    // flags are kept and the verified short-circuit avoids a needless re-probe.
-    // Runs before discovery and the initial-sync gate so the upgrade is silent.
+    // Runs before discovery and the sync gate so the dimmer->blind upgrade is silent
     await this._migrateDimmerTypesToBlind();
 
     try {
@@ -93,8 +87,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       await this._cleanupOrphanedEndpoints();
 
       await this._applyLabelsFromSettings(this.getSettings());
-      await this.setStoreValue('endpointTypes', this._endpointTypes);
-      await this.setStoreValue('endpointTypesVerified', this._endpointTypesVerified);
+      await this._persistEndpointTypes();
       this._startHealthCheck();
 
       this.log('onNodeInit finished successfully.');
@@ -118,6 +111,11 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       await this.setStoreValue('endpointTypes', this._endpointTypes);
       this.log('[MIGRATION] Renamed stored dimmer endpoint type(s) to blind');
     }
+  }
+
+  async _persistEndpointTypes() {
+    await this.setStoreValue('endpointTypes', this._endpointTypes);
+    await this.setStoreValue('endpointTypesVerified', this._endpointTypesVerified);
   }
 
   async onSettings({ oldSettings, newSettings, changedKeys = [] }) {
@@ -148,9 +146,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     Object.values(this._syncTimeouts).forEach(timeout => this.homey.clearTimeout(timeout));
     this._syncTimeouts = {};
 
-    Object.values(this._blindTravelTimeouts || {}).forEach(timeout =>
-      this.homey.clearTimeout(timeout)
-    );
+    Object.values(this._blindTravelTimeouts).forEach(timeout => this.homey.clearTimeout(timeout));
     this._blindTravelTimeouts = {};
 
     // super.onDeleted() removes all command class listeners on the root node,
@@ -180,31 +176,24 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     );
   }
 
-  // Wires windowcoverings_state.ep{N} to a hand-rolled SET handler. There is no
-  // system map for this capability over SWITCH_MULTILEVEL, so the listener is
-  // the single point that enqueues the raw frame and owns the optimistic state.
+  // No system map for windowcoverings_state over SWITCH_MULTILEVEL, so wire it by hand
   _registerBlindListener(endpointNum) {
     const cap = `windowcoverings_state.ep${endpointNum}`;
     this.registerCapabilityListener(cap, value => this._onBlindStateSet(endpointNum, value));
   }
 
-  // SET handler for a blind's windowcoverings_state. Flow actions reach it via
-  // triggerCapabilityListener, so this is the one enqueue point - do NOT also
-  // route blind actions through queueCapabilityCommand or the frame double-queues.
+  // The one enqueue point for blinds (flow actions reach it via triggerCapabilityListener);
+  // don't also route them through queueCapabilityCommand or the frame double-queues.
   async _onBlindStateSet(endpointNum, value) {
     if (!['up', 'down', 'idle'].includes(value)) {
       throw new Error(`Unsupported blind state: ${value}`);
     }
 
-    // Apply the optimistic state first so the widget updates and the travel
-    // timer starts immediately, independent of how long the frame takes (or
-    // whether the queue is cleared mid-flight during onDeleted).
+    // Optimistic state first so the widget and travel timer don't wait on the frame
     await this._applyBlindStateLocally(endpointNum, value, { fireTrigger: true });
 
-    // Then enqueue the actual Z-Wave drive fire-and-forget. queue.add() only
-    // resolves once the frame settles (up to the 10s timeout); awaiting it here
-    // would block the optimistic update, and a 'Queue cleared' rejection on
-    // teardown would otherwise surface as an unhandled rejection.
+    // Fire-and-forget: awaiting would block the optimistic update, and a teardown
+    // 'Queue cleared' rejection would otherwise go unhandled
     if (this._commandQueue) {
       this._commandQueue
         .add(() => this._driveBlind(endpointNum, value), `Blind EP${endpointNum} = ${value}`)
@@ -330,8 +319,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       );
       try {
         await this._discoverAllEndpoints(this.node);
-        await this.setStoreValue('endpointTypes', this._endpointTypes);
-        await this.setStoreValue('endpointTypesVerified', this._endpointTypesVerified);
+        await this._persistEndpointTypes();
       } catch (error) {
         this.error('[HEALTH] Rediscovery failed:', error.message || error);
       }
@@ -363,8 +351,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
         const endpointNum = parseInt(id, 10);
         await this._discoverOneEndpoint(endpointNum, endpoints[id]);
       }
-      await this.setStoreValue('endpointTypes', this._endpointTypes);
-      await this.setStoreValue('endpointTypesVerified', this._endpointTypesVerified);
+      await this._persistEndpointTypes();
     } catch (error) {
       this.error('[HEALTH] Endpoint re-verification failed:', error.message || error);
     }
@@ -581,8 +568,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     try {
       await this._registerEndpointCapabilities(endpointNum, deviceType, commandClass);
       this._endpointTypes[endpointNum] = deviceType;
-      await this.setStoreValue('endpointTypes', this._endpointTypes);
-      await this.setStoreValue('endpointTypesVerified', this._endpointTypesVerified);
+      await this._persistEndpointTypes();
       this.log(`[CAPABILITY] EP${endpointNum} capabilities registered as ${deviceType}`);
     } catch (error) {
       // Silently handle expected timeout errors during discovery
@@ -590,8 +576,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       if (this._isTransientError(errorMsg)) {
         // Still mark the endpoint type so it's not lost
         this._endpointTypes[endpointNum] = deviceType;
-        await this.setStoreValue('endpointTypes', this._endpointTypes);
-        await this.setStoreValue('endpointTypesVerified', this._endpointTypesVerified);
+        await this._persistEndpointTypes();
         this.log(
           `[ENDPOINT ${endpointNum}] Registered as ${deviceType} (initial state will sync later)`
         );
@@ -900,8 +885,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
       // panel again instead of pinning the endpoint to null forever
       delete this._endpointTypesVerified[endpointNum];
       await this._removeEndpointCapabilities(endpointNum);
-      await this.setStoreValue('endpointTypes', this._endpointTypes);
-      await this.setStoreValue('endpointTypesVerified', this._endpointTypesVerified);
+      await this._persistEndpointTypes();
     }
   }
 
@@ -962,10 +946,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
     return false;
   }
 
-  // Older versions wrote the blinds' always-0 multilevel report into onoff/dim
-  // as off/0%, which was fabricated. The blind remodel removes onoff/dim from
-  // blind endpoints entirely (so the fabricated values are gone with the
-  // capability); this defensively clears any that linger, once.
+  // Clears the fabricated off/0% values older versions wrote onto blind endpoints, once
   async _resetBlindStateOnce() {
     if (await this.getStoreValue('blindStateResetDone')) return;
 
@@ -1034,10 +1015,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   }
 
   _sanitizeLabel(raw) {
-    return (raw || '')
-      .trim()
-      .substring(0, 50) // Limit length
-      .replace(/[<>]/g, ''); // Remove potential HTML
+    return (raw || '').trim().substring(0, 50).replace(/[<>]/g, '');
   }
 
   // The capability whose title carries the user-facing label for an endpoint
@@ -1092,6 +1070,7 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   }
 
   async _removeEndpointCapabilities(endpointNum) {
+    // dim.ep* must stay declared in driver.compose.json so this remove() is allowed on dimmer-era devices
     await this._removeIfPresent(`dim.ep${endpointNum}`);
     await this._removeIfPresent(`onoff.ep${endpointNum}`);
     await this._removeIfPresent(`windowcoverings_state.ep${endpointNum}`);
@@ -1194,13 +1173,8 @@ module.exports = class WallWandDevice extends ZwaveDevice {
   }
 
   async _setOnOff(cap, value, endpointNum) {
-    if (!cap || typeof cap !== 'string') {
-      this.error('[ONOFF] Invalid capability ID');
-      return;
-    }
-
     if (!this.hasCapability(cap)) {
-      // Silently ignore if capability doesn't exist yet (race condition during discovery)
+      // not registered yet (discovery race)
       return;
     }
 

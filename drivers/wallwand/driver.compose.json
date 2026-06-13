@@ -130,7 +130,7 @@
       },
       "value": "",
       "hint": {
-        "en": "Custom name for the switch/dimmer on endpoint 1."
+        "en": "Custom name for the switch or blind on endpoint 1."
       }
     },
     {
@@ -141,7 +141,7 @@
       },
       "value": "",
       "hint": {
-        "en": "Custom name for the switch/dimmer on endpoint 2."
+        "en": "Custom name for the switch or blind on endpoint 2."
       }
     },
     {
@@ -152,7 +152,7 @@
       },
       "value": "",
       "hint": {
-        "en": "Custom name for the switch/dimmer on endpoint 3."
+        "en": "Custom name for the switch or blind on endpoint 3."
       }
     },
     {
@@ -163,7 +163,7 @@
       },
       "value": "",
       "hint": {
-        "en": "Custom name for the switch/dimmer on endpoint 4."
+        "en": "Custom name for the switch or blind on endpoint 4."
       }
     },
     {
@@ -174,7 +174,7 @@
       },
       "value": "",
       "hint": {
-        "en": "Custom name for the switch/dimmer on endpoint 5."
+        "en": "Custom name for the switch or blind on endpoint 5."
       }
     },
     {
@@ -185,7 +185,7 @@
       },
       "value": "",
       "hint": {
-        "en": "Custom name for the switch/dimmer on endpoint 6."
+        "en": "Custom name for the switch or blind on endpoint 6."
       }
     },
     {

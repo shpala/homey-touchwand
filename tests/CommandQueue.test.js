@@ -91,20 +91,12 @@ describe('CommandQueue', () => {
     await expect(p1).resolves.toBeUndefined();
   });
 
-  test('should timeout slow commands', async () => {
-    const executor = jest.fn().mockImplementation(async () => {
-      return new Promise(resolve => setTimeout(resolve, 200)); // finishes in 200ms, timeout is 100ms
-    });
-
-    await expect(queue.add(executor, 'Slow Cmd')).rejects.toThrow(/timed out/);
-    expect(mockError).toHaveBeenCalledWith(expect.stringContaining('Failed: Slow Cmd'));
-  });
-
-  test('accepts delay and timeout via constructor', async () => {
+  test('times out a slow command, honoring the constructor timeout', async () => {
     const q = new CommandQueue(mockLogger, 5, 50);
     const executor = () => new Promise(resolve => setTimeout(resolve, 200));
 
     await expect(q.add(executor, 'Slow Cmd')).rejects.toThrow(/timed out after 50ms/);
+    expect(mockError).toHaveBeenCalledWith(expect.stringContaining('Failed: Slow Cmd'));
   });
 
   test('logs a warning when a timed-out command resolves late', async () => {
